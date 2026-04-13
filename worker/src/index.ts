@@ -196,6 +196,29 @@ async function authenticate(
 
 // --- Replicate helpers ---
 
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 5,
+): Promise<Response> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url, init);
+    if (response.status === 429 && attempt < maxRetries) {
+      // Parse retry_after or default to 10 seconds
+      const body = await response.text();
+      let waitSec = 10;
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed.retry_after) waitSec = parsed.retry_after;
+      } catch { /* use default */ }
+      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      continue;
+    }
+    return response;
+  }
+  throw new Error("Rate limited: too many retries");
+}
+
 async function createPrediction(
   fileData: ArrayBuffer,
   fileName: string,
@@ -239,7 +262,7 @@ async function createPrediction(
     input.language = language;
   }
 
-  const response = await fetch("https://api.replicate.com/v1/predictions", {
+  const response = await fetchWithRetry("https://api.replicate.com/v1/predictions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -250,7 +273,8 @@ async function createPrediction(
   });
 
   if (!response.ok) {
-    throw new Error("Transcription service error");
+    const errBody = await response.text();
+    throw new Error(`Replicate ${response.status}: ${errBody.slice(0, 300)}`);
   }
 
   return response.json();
@@ -271,7 +295,7 @@ async function createPredictionFromUrl(
     input.language = language;
   }
 
-  const response = await fetch("https://api.replicate.com/v1/predictions", {
+  const response = await fetchWithRetry("https://api.replicate.com/v1/predictions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -282,7 +306,8 @@ async function createPredictionFromUrl(
   });
 
   if (!response.ok) {
-    throw new Error("Transcription service error");
+    const errBody = await response.text();
+    throw new Error(`Replicate ${response.status}: ${errBody.slice(0, 300)}`);
   }
 
   return response.json();
@@ -523,8 +548,10 @@ export default {
         env.ALLOWED_ORIGINS,
       );
     } catch (err) {
+      const debug = err instanceof Error ? err.message : String(err);
+      console.error("Worker error:", debug);
       return jsonResponse(
-        { error: "Internal server error" },
+        { error: "Internal server error", debug },
         500,
         origin,
         env.ALLOWED_ORIGINS,
