@@ -24,15 +24,17 @@ const WHISPER_MODEL_VERSION =
 
 // Constant-time string comparison to prevent timing attacks
 function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) {
-    // Compare against self to maintain constant time even on length mismatch
-    b = a;
+  const lenA = a.length;
+  const lenB = b.length;
+  // Always iterate over the longer string to avoid leaking length
+  const maxLen = Math.max(lenA, lenB);
+  let mismatch = lenA ^ lenB; // nonzero if lengths differ
+  for (let i = 0; i < maxLen; i++) {
+    const charA = i < lenA ? a.charCodeAt(i) : 0;
+    const charB = i < lenB ? b.charCodeAt(i) : 0;
+    mismatch |= charA ^ charB;
   }
-  let result = a.length ^ b.length;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
+  return mismatch === 0;
 }
 
 function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
