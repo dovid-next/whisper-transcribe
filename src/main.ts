@@ -203,8 +203,6 @@ async function startTranscription() {
   const language = languageSelect.value;
   const total = state.files.length;
   let completed = 0;
-  let authFailed = false;
-  const PARALLEL = 3;
 
   // Reset all statuses
   for (const entry of state.files) {
@@ -214,53 +212,45 @@ async function startTranscription() {
   }
   renderFileList();
 
-  // Process files in parallel batches of PARALLEL
-  for (let i = 0; i < state.files.length; i += PARALLEL) {
-    if (state.cancelled || authFailed) break;
+  // Process files sequentially (Replicate limits concurrent predictions)
+  for (let idx = 0; idx < state.files.length; idx++) {
+    if (state.cancelled) break;
 
-    const batch = state.files.slice(i, i + PARALLEL);
-    for (const entry of batch) {
-      entry.status = "processing";
-    }
+    const entry = state.files[idx];
+    entry.status = "processing";
     renderFileList();
+
     progressText.textContent = "Transcribing...";
     progressCount.textContent = `${completed}/${total}`;
     progressBar.style.width = `${(completed / total) * 100}%`;
-    currentFileEl.textContent = batch.map((e) => e.file.name).join(", ");
+    currentFileEl.textContent = entry.file.name;
 
-    const results = await Promise.allSettled(
-      batch.map((entry) => transcribeFile(entry.file, language, state.password)),
-    );
-
-    for (let j = 0; j < batch.length; j++) {
-      const entry = batch[j];
-      const result = results[j];
-      if (result.status === "fulfilled") {
-        entry.result = result.value;
-        entry.status = "done";
-        addResultCard(entry, i + j);
-      } else {
-        const msg = result.reason instanceof Error ? result.reason.message : "Unknown error";
-        entry.status = "error";
-        entry.error = msg;
-
-        if (msg.startsWith("LOCKED:") || msg.includes("attempt(s) remaining")) {
-          localStorage.removeItem("transcriptor-password");
-          state.password = "";
-          appEl.classList.add("app-locked");
-          passwordGate.classList.remove("unlocked");
-          passwordInput.value = "";
-          unlockBtn.textContent = "Unlock";
-          errorMsg.hidden = false;
-          if (msg.startsWith("LOCKED:")) {
-            errorMsg.innerHTML = 'Access locked after too many failed attempts.<br>To reset, run: <strong>unlock transcriptor</strong>';
-          } else {
-            errorMsg.textContent = msg;
-          }
-          authFailed = true;
-        }
-      }
+    try {
+      entry.result = await transcribeFile(entry.file, language, state.password);
+      entry.status = "done";
       completed++;
+      addResultCard(entry, idx);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      entry.status = "error";
+      entry.error = msg;
+      completed++;
+
+      if (msg.startsWith("LOCKED:") || msg.includes("attempt(s) remaining")) {
+        localStorage.removeItem("transcriptor-password");
+        state.password = "";
+        appEl.classList.add("app-locked");
+        passwordGate.classList.remove("unlocked");
+        passwordInput.value = "";
+        unlockBtn.textContent = "Unlock";
+        errorMsg.hidden = false;
+        if (msg.startsWith("LOCKED:")) {
+          errorMsg.innerHTML = 'Access locked after too many failed attempts.<br>To reset, run: <strong>unlock transcriptor</strong>';
+        } else {
+          errorMsg.textContent = msg;
+        }
+        break;
+      }
     }
 
     renderFileList();
@@ -268,7 +258,7 @@ async function startTranscription() {
     progressBar.style.width = `${(completed / total) * 100}%`;
   }
 
-  progressText.textContent = state.cancelled ? "Cancelled" : authFailed ? "Auth failed" : "Complete!";
+  progressText.textContent = state.cancelled ? "Cancelled" : "Complete!";
   currentFileEl.textContent = "";
   state.isProcessing = false;
   state.cancelled = false;
