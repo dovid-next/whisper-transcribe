@@ -10,7 +10,7 @@ import path from "path";
 // Configuration — set your Worker URL here or via environment variable
 const API_URL =
   process.env.TRANSCRIPTOR_API_URL ||
-  "https://transcriptor-api.YOUR_SUBDOMAIN.workers.dev";
+  "https://transcriptor-api.dovid-b43.workers.dev";
 
 const server = new Server(
   { name: "transcriptor", version: "1.0.0" },
