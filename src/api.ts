@@ -60,18 +60,20 @@ export async function transcribeFile(
 
   // Otherwise, poll for the result
   if (data.jobId) {
-    return pollForResult(data.jobId);
+    return pollForResult(data.jobId, password);
   }
 
   throw new Error("Unexpected response from server");
 }
 
-async function pollForResult(jobId: string): Promise<TranscriptResult> {
+async function pollForResult(jobId: string, password: string): Promise<TranscriptResult> {
   const maxAttempts = 120; // 10 minutes max
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, 5000));
 
-    const response = await fetch(`${API_BASE}/status/${jobId}`);
+    const response = await fetch(`${API_BASE}/status/${jobId}`, {
+      headers: { "X-API-Password": password },
+    });
     const data: TranscribeResponse = await response.json();
 
     if (data.status === "succeeded" && data.transcript) {

@@ -494,7 +494,7 @@ export default {
         origin,
         env.ALLOWED_ORIGINS,
       );
-    } catch (_err) {
+    } catch (err) {
       return jsonResponse(
         { error: "Internal server error" },
         500,
