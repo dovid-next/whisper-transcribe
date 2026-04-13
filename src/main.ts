@@ -254,7 +254,7 @@ function addResultCard(entry: FileEntry, index: number) {
     <div class="result-card-header" data-index="${index}">
       <span class="result-card-title">${escapeHtml(entry.file.name)}</span>
       <div class="result-card-meta">
-        <span class="lang-badge">${entry.result.language}</span>
+        <span class="lang-badge">${escapeHtml(entry.result.language)}</span>
         <span class="expand-icon">&#9660;</span>
       </div>
     </div>

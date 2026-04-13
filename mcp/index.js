@@ -11,8 +11,11 @@ import path from "path";
 const API_URL =
   process.env.TRANSCRIPTOR_API_URL ||
   "https://transcriptor-api.dovid-b43.workers.dev";
-const API_PASSWORD =
-  process.env.TRANSCRIPTOR_PASSWORD || "transcribe2026";
+const API_PASSWORD = process.env.TRANSCRIPTOR_PASSWORD;
+if (!API_PASSWORD) {
+  console.error("TRANSCRIPTOR_PASSWORD environment variable is required");
+  process.exit(1);
+}
 
 const server = new Server(
   { name: "transcriptor", version: "1.0.0" },

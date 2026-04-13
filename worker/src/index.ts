@@ -22,7 +22,31 @@ interface ReplicatePrediction {
 const WHISPER_MODEL_VERSION =
   "8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e";
 
+// Constant-time string comparison to prevent timing attacks
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    // Compare against self to maintain constant time even on length mismatch
+    b = a;
+  }
+  let result = a.length ^ b.length;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
 function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
+  // If allowedOrigins is a specific domain, only allow that origin
+  if (allowedOrigins !== "*") {
+    const allowed = allowedOrigins.split(",").map((s) => s.trim());
+    if (!allowed.includes(origin)) {
+      return {
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-API-Password",
+        "Access-Control-Max-Age": "86400",
+      };
+    }
+  }
   return {
     "Access-Control-Allow-Origin": allowedOrigins === "*" ? "*" : origin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -41,9 +65,16 @@ function jsonResponse(
     status,
     headers: {
       "Content-Type": "application/json",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
       ...corsHeaders(origin, allowedOrigins),
     },
   });
+}
+
+function authenticate(request: Request, env: Env): boolean {
+  const authHeader = request.headers.get("X-API-Password") || "";
+  return timingSafeEqual(authHeader, env.API_PASSWORD);
 }
 
 async function createPrediction(
@@ -52,10 +83,7 @@ async function createPrediction(
   language: string | null,
   token: string,
 ): Promise<ReplicatePrediction> {
-  // Convert file to base64 data URI for Replicate
-  const base64 = btoa(
-    String.fromCharCode(...new Uint8Array(fileData)),
-  );
+  const base64 = btoa(String.fromCharCode(...new Uint8Array(fileData)));
   const ext = fileName.split(".").pop()?.toLowerCase() || "mp3";
   const mimeMap: Record<string, string> = {
     mp3: "audio/mpeg",
@@ -101,8 +129,7 @@ async function createPrediction(
   });
 
   if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Replicate API error (${response.status}): ${errText}`);
+    throw new Error("Transcription service error");
   }
 
   return response.json();
@@ -139,8 +166,7 @@ async function createPredictionFromUrl(
   });
 
   if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Replicate API error (${response.status}): ${errText}`);
+    throw new Error("Transcription service error");
   }
 
   return response.json();
@@ -159,6 +185,11 @@ async function getPrediction(
   return response.json();
 }
 
+// Validate job ID format (Replicate uses UUIDs)
+function isValidJobId(id: string): boolean {
+  return /^[a-z0-9]{20,}$/.test(id);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -171,10 +202,12 @@ export default {
       });
     }
 
-    // Authenticate all POST requests
-    if (request.method === "POST") {
-      const authHeader = request.headers.get("X-API-Password") || "";
-      if (authHeader !== env.API_PASSWORD) {
+    // Authenticate all POST requests and /status endpoint
+    if (
+      request.method === "POST" ||
+      url.pathname.startsWith("/status/")
+    ) {
+      if (!authenticate(request, env)) {
         return jsonResponse(
           { error: "Unauthorized" },
           401,
@@ -205,13 +238,9 @@ export default {
             );
           }
 
-          // Check file size (100MB limit for base64 in Worker memory)
           if (file.size > 100 * 1024 * 1024) {
             return jsonResponse(
-              {
-                error:
-                  "File too large. Max 100MB for direct upload. Use URL upload for larger files.",
-              },
+              { error: "File too large. Max 100MB." },
               413,
               origin,
               env.ALLOWED_ORIGINS,
@@ -232,7 +261,7 @@ export default {
           };
           if (!body.url) {
             return jsonResponse(
-              { error: "No url provided in JSON body" },
+              { error: "No url provided" },
               400,
               origin,
               env.ALLOWED_ORIGINS,
@@ -265,13 +294,12 @@ export default {
           );
         } else if (prediction.status === "failed") {
           return jsonResponse(
-            { error: prediction.error || "Transcription failed" },
+            { error: "Transcription failed" },
             500,
             origin,
             env.ALLOWED_ORIGINS,
           );
         } else {
-          // Still processing — return prediction ID for polling
           return jsonResponse(
             { jobId: prediction.id, status: prediction.status },
             202,
@@ -281,12 +309,12 @@ export default {
         }
       }
 
-      // GET /status/:jobId — check transcription status
+      // GET /status/:jobId — check transcription status (authenticated above)
       if (url.pathname.startsWith("/status/") && request.method === "GET") {
         const jobId = url.pathname.split("/status/")[1];
-        if (!jobId) {
+        if (!jobId || !isValidJobId(jobId)) {
           return jsonResponse(
-            { error: "No job ID provided" },
+            { error: "Invalid job ID" },
             400,
             origin,
             env.ALLOWED_ORIGINS,
@@ -312,10 +340,7 @@ export default {
           );
         } else if (prediction.status === "failed") {
           return jsonResponse(
-            {
-              status: "failed",
-              error: prediction.error || "Transcription failed",
-            },
+            { status: "failed", error: "Transcription failed" },
             200,
             origin,
             env.ALLOWED_ORIGINS,
@@ -330,14 +355,9 @@ export default {
         }
       }
 
-      // Health check
+      // Health check — no auth needed, no service info leaked
       if (url.pathname === "/" && request.method === "GET") {
-        return jsonResponse(
-          { status: "ok", service: "transcriptor-api" },
-          200,
-          origin,
-          env.ALLOWED_ORIGINS,
-        );
+        return jsonResponse({ status: "ok" }, 200, origin, env.ALLOWED_ORIGINS);
       }
 
       return jsonResponse(
@@ -346,10 +366,9 @@ export default {
         origin,
         env.ALLOWED_ORIGINS,
       );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Internal error";
+    } catch (_err) {
       return jsonResponse(
-        { error: message },
+        { error: "Internal server error" },
         500,
         origin,
         env.ALLOWED_ORIGINS,
