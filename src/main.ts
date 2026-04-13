@@ -229,7 +229,11 @@ async function startTranscription() {
         passwordInput.value = "";
         unlockBtn.textContent = "Unlock";
         errorMsg.hidden = false;
-        errorMsg.textContent = msg.replace("LOCKED: ", "");
+        if (msg.startsWith("LOCKED:")) {
+          errorMsg.innerHTML = 'Access locked after too many failed attempts.<br>Ask Claude Code: <strong>"unlock transcriptor"</strong>';
+        } else {
+          errorMsg.textContent = msg;
+        }
         // Stop processing remaining files
         break;
       }
