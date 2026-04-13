@@ -194,7 +194,14 @@ async function createPrediction(
   language: string | null,
   token: string,
 ): Promise<ReplicatePrediction> {
-  const base64 = btoa(String.fromCharCode(...new Uint8Array(fileData)));
+  // Convert in chunks to avoid call stack overflow on large files
+  const bytes = new Uint8Array(fileData);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  const base64 = btoa(binary);
   const ext = fileName.split(".").pop()?.toLowerCase() || "mp3";
   const mimeMap: Record<string, string> = {
     mp3: "audio/mpeg",
