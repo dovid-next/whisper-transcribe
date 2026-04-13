@@ -215,9 +215,24 @@ async function startTranscription() {
       completed++;
       addResultCard(entry, idx);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
       entry.status = "error";
-      entry.error = err instanceof Error ? err.message : "Unknown error";
+      entry.error = msg;
       completed++;
+
+      // Handle lockout or auth failure
+      if (msg.startsWith("LOCKED:") || msg.includes("attempt(s) remaining")) {
+        localStorage.removeItem("transcriptor-password");
+        state.password = "";
+        appEl.classList.add("app-locked");
+        passwordGate.classList.remove("unlocked");
+        passwordInput.value = "";
+        unlockBtn.textContent = "Unlock";
+        errorMsg.hidden = false;
+        errorMsg.textContent = msg.replace("LOCKED: ", "");
+        // Stop processing remaining files
+        break;
+      }
     }
 
     renderFileList();

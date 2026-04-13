@@ -2,6 +2,7 @@ interface Env {
   REPLICATE_API_TOKEN: string;
   ALLOWED_ORIGINS: string;
   API_PASSWORD: string;
+  PIN_SECURITY: KVNamespace;
 }
 
 interface ReplicatePrediction {
@@ -19,16 +20,64 @@ interface ReplicatePrediction {
   error?: string;
 }
 
+interface LockoutState {
+  failedAttempts: number;
+  locked: boolean;
+  lockedAt: string;
+  lastFailureIp: string;
+}
+
 const WHISPER_MODEL_VERSION =
   "8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e";
 
-// Constant-time string comparison to prevent timing attacks
+const MAX_ATTEMPTS = 3;
+const LOCKOUT_KEY = "password_lockout";
+
+// --- Lockout helpers ---
+
+async function getLockoutState(env: Env): Promise<LockoutState> {
+  const raw = await env.PIN_SECURITY.get(LOCKOUT_KEY);
+  if (!raw) {
+    return { failedAttempts: 0, locked: false, lockedAt: "", lastFailureIp: "" };
+  }
+  return JSON.parse(raw);
+}
+
+async function setLockoutState(env: Env, state: LockoutState): Promise<void> {
+  await env.PIN_SECURITY.put(LOCKOUT_KEY, JSON.stringify(state));
+}
+
+async function recordFailure(env: Env, ip: string): Promise<LockoutState> {
+  const state = await getLockoutState(env);
+  const updated: LockoutState = {
+    ...state,
+    failedAttempts: state.failedAttempts + 1,
+    lastFailureIp: ip,
+  };
+  if (updated.failedAttempts >= MAX_ATTEMPTS) {
+    updated.locked = true;
+    updated.lockedAt = new Date().toISOString();
+  }
+  await setLockoutState(env, updated);
+  return updated;
+}
+
+async function resetFailures(env: Env): Promise<void> {
+  await setLockoutState(env, {
+    failedAttempts: 0,
+    locked: false,
+    lockedAt: "",
+    lastFailureIp: "",
+  });
+}
+
+// --- Constant-time comparison ---
+
 function timingSafeEqual(a: string, b: string): boolean {
   const lenA = a.length;
   const lenB = b.length;
-  // Always iterate over the longer string to avoid leaking length
   const maxLen = Math.max(lenA, lenB);
-  let mismatch = lenA ^ lenB; // nonzero if lengths differ
+  let mismatch = lenA ^ lenB;
   for (let i = 0; i < maxLen; i++) {
     const charA = i < lenA ? a.charCodeAt(i) : 0;
     const charB = i < lenB ? b.charCodeAt(i) : 0;
@@ -37,8 +86,9 @@ function timingSafeEqual(a: string, b: string): boolean {
   return mismatch === 0;
 }
 
+// --- CORS ---
+
 function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
-  // If allowedOrigins is a specific domain, only allow that origin
   if (allowedOrigins !== "*") {
     const allowed = allowedOrigins.split(",").map((s) => s.trim());
     if (!allowed.includes(origin)) {
@@ -74,10 +124,68 @@ function jsonResponse(
   });
 }
 
-function authenticate(request: Request, env: Env): boolean {
+// --- Auth with lockout ---
+
+async function authenticate(
+  request: Request,
+  env: Env,
+  origin: string,
+): Promise<Response | null> {
+  const state = await getLockoutState(env);
+
+  // If locked, reject immediately
+  if (state.locked) {
+    return jsonResponse(
+      {
+        error: "Access locked after too many failed attempts. Contact admin to unlock.",
+        locked: true,
+      },
+      423,
+      origin,
+      env.ALLOWED_ORIGINS,
+    );
+  }
+
   const authHeader = request.headers.get("X-API-Password") || "";
-  return timingSafeEqual(authHeader, env.API_PASSWORD);
+  const valid = timingSafeEqual(authHeader, env.API_PASSWORD);
+
+  if (!valid) {
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    const updated = await recordFailure(env, ip);
+    const remaining = Math.max(0, MAX_ATTEMPTS - updated.failedAttempts);
+
+    if (updated.locked) {
+      return jsonResponse(
+        {
+          error: "Access locked after too many failed attempts. Contact admin to unlock.",
+          locked: true,
+        },
+        423,
+        origin,
+        env.ALLOWED_ORIGINS,
+      );
+    }
+
+    return jsonResponse(
+      {
+        error: `Invalid password. ${remaining} attempt(s) remaining.`,
+        remainingAttempts: remaining,
+      },
+      401,
+      origin,
+      env.ALLOWED_ORIGINS,
+    );
+  }
+
+  // Successful auth — reset failures if any existed
+  if (state.failedAttempts > 0) {
+    await resetFailures(env);
+  }
+
+  return null; // null = authenticated OK
 }
+
+// --- Replicate helpers ---
 
 async function createPrediction(
   fileData: ArrayBuffer,
@@ -124,10 +232,7 @@ async function createPrediction(
       "Content-Type": "application/json",
       Prefer: "wait",
     },
-    body: JSON.stringify({
-      version: WHISPER_MODEL_VERSION,
-      input,
-    }),
+    body: JSON.stringify({ version: WHISPER_MODEL_VERSION, input }),
   });
 
   if (!response.ok) {
@@ -161,10 +266,7 @@ async function createPredictionFromUrl(
       "Content-Type": "application/json",
       Prefer: "wait",
     },
-    body: JSON.stringify({
-      version: WHISPER_MODEL_VERSION,
-      input,
-    }),
+    body: JSON.stringify({ version: WHISPER_MODEL_VERSION, input }),
   });
 
   if (!response.ok) {
@@ -180,50 +282,80 @@ async function getPrediction(
 ): Promise<ReplicatePrediction> {
   const response = await fetch(
     `https://api.replicate.com/v1/predictions/${id}`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-    },
+    { headers: { Authorization: `Bearer ${token}` } },
   );
   return response.json();
 }
 
-// Validate job ID format (Replicate uses UUIDs)
 function isValidJobId(id: string): boolean {
   return /^[a-z0-9]{20,}$/.test(id);
 }
+
+// --- Admin unlock endpoint ---
+
+async function handleAdminUnlock(
+  request: Request,
+  env: Env,
+  origin: string,
+): Promise<Response> {
+  // Admin unlock requires both the password AND a special admin header
+  const authHeader = request.headers.get("X-API-Password") || "";
+  const adminHeader = request.headers.get("X-Admin-Unlock") || "";
+
+  if (
+    !timingSafeEqual(authHeader, env.API_PASSWORD) ||
+    adminHeader !== "true"
+  ) {
+    return jsonResponse(
+      { error: "Unauthorized" },
+      401,
+      origin,
+      env.ALLOWED_ORIGINS,
+    );
+  }
+
+  await resetFailures(env);
+  return jsonResponse(
+    { message: "Lockout reset successfully", failedAttempts: 0, locked: false },
+    200,
+    origin,
+    env.ALLOWED_ORIGINS,
+  );
+}
+
+// --- Main handler ---
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
 
-    // Handle CORS preflight
+    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        headers: corsHeaders(origin, env.ALLOWED_ORIGINS),
+        headers: {
+          ...corsHeaders(origin, env.ALLOWED_ORIGINS),
+          "Access-Control-Allow-Headers":
+            "Content-Type, X-API-Password, X-Admin-Unlock",
+        },
       });
     }
 
+    // Admin unlock endpoint (POST /admin/unlock)
+    if (url.pathname === "/admin/unlock" && request.method === "POST") {
+      return handleAdminUnlock(request, env, origin);
+    }
+
     // Authenticate all POST requests and /status endpoint
-    if (
-      request.method === "POST" ||
-      url.pathname.startsWith("/status/")
-    ) {
-      if (!authenticate(request, env)) {
-        return jsonResponse(
-          { error: "Unauthorized" },
-          401,
-          origin,
-          env.ALLOWED_ORIGINS,
-        );
-      }
+    if (request.method === "POST" || url.pathname.startsWith("/status/")) {
+      const authResult = await authenticate(request, env, origin);
+      if (authResult) return authResult; // non-null = auth failed
     }
 
     try {
-      // POST /transcribe — single file transcription
+      // POST /transcribe
       if (url.pathname === "/transcribe" && request.method === "POST") {
         const contentType = request.headers.get("Content-Type") || "";
-
         let prediction: ReplicatePrediction;
 
         if (contentType.includes("multipart/form-data")) {
@@ -311,7 +443,7 @@ export default {
         }
       }
 
-      // GET /status/:jobId — check transcription status (authenticated above)
+      // GET /status/:jobId
       if (url.pathname.startsWith("/status/") && request.method === "GET") {
         const jobId = url.pathname.split("/status/")[1];
         if (!jobId || !isValidJobId(jobId)) {
@@ -323,10 +455,7 @@ export default {
           );
         }
 
-        const prediction = await getPrediction(
-          jobId,
-          env.REPLICATE_API_TOKEN,
-        );
+        const prediction = await getPrediction(jobId, env.REPLICATE_API_TOKEN);
 
         if (prediction.status === "succeeded" && prediction.output) {
           return jsonResponse(
@@ -357,7 +486,7 @@ export default {
         }
       }
 
-      // Health check — no auth needed, no service info leaked
+      // Health check
       if (url.pathname === "/" && request.method === "GET") {
         return jsonResponse({ status: "ok" }, 200, origin, env.ALLOWED_ORIGINS);
       }

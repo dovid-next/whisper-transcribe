@@ -5,5 +5,10 @@ compatibility_date = "2024-01-01"
 [vars]
 ALLOWED_ORIGINS = "https://transcriptor-d31.pages.dev"
 
-# Set your Replicate API token as a secret:
-# npx wrangler secret put REPLICATE_API_TOKEN
+[[kv_namespaces]]
+binding = "PIN_SECURITY"
+id = "ff7af5d8907f4d58a9b46ca1c724fcbd"
+
+# Secrets (set via wrangler secret put):
+# REPLICATE_API_TOKEN
+# API_PASSWORD

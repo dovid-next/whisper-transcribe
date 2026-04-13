@@ -32,7 +32,18 @@ export async function transcribeFile(
     body: formData,
   });
 
-  const data: TranscribeResponse = await response.json();
+  const data: TranscribeResponse & { locked?: boolean; remainingAttempts?: number } = await response.json();
+
+  if (response.status === 423) {
+    throw new Error("LOCKED: Access locked after too many failed attempts. Contact admin to unlock.");
+  }
+
+  if (response.status === 401) {
+    const msg = data.remainingAttempts !== undefined
+      ? `Invalid password. ${data.remainingAttempts} attempt(s) remaining.`
+      : "Invalid password.";
+    throw new Error(msg);
+  }
 
   if (data.error) {
     throw new Error(data.error);
