@@ -150,7 +150,7 @@ function renderFileList() {
 
   fileList.hidden = false;
   dropZone.classList.add("has-files");
-  transcribeBtn.disabled = state.isProcessing;
+  transcribeBtn.disabled = false;
 
   fileCount.textContent = `${state.files.length} file${state.files.length !== 1 ? "s" : ""} selected`;
 
