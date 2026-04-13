@@ -230,7 +230,7 @@ async function startTranscription() {
         unlockBtn.textContent = "Unlock";
         errorMsg.hidden = false;
         if (msg.startsWith("LOCKED:")) {
-          errorMsg.innerHTML = 'Access locked after too many failed attempts.<br>Ask Claude Code: <strong>"unlock transcriptor"</strong>';
+          errorMsg.innerHTML = 'Access locked after too many failed attempts.<br>To reset, type <strong>"unlock transcriptor"</strong> in Claude Code.';
         } else {
           errorMsg.textContent = msg;
         }
