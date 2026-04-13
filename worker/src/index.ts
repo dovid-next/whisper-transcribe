@@ -2,6 +2,7 @@ interface Env {
   REPLICATE_API_TOKEN: string;
   ALLOWED_ORIGINS: string;
   API_PASSWORD: string;
+  ADMIN_SECRET: string;
   PIN_SECURITY: KVNamespace;
 }
 
@@ -94,7 +95,7 @@ function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
     if (!allowed.includes(origin)) {
       return {
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, X-API-Password",
+        "Access-Control-Allow-Headers": "Content-Type, X-API-Password, X-Admin-Secret",
         "Access-Control-Max-Age": "86400",
       };
     }
@@ -102,7 +103,7 @@ function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
   return {
     "Access-Control-Allow-Origin": allowedOrigins === "*" ? "*" : origin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-API-Password",
+    "Access-Control-Allow-Headers": "Content-Type, X-API-Password, X-Admin-Secret",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -298,14 +299,10 @@ async function handleAdminUnlock(
   env: Env,
   origin: string,
 ): Promise<Response> {
-  // Admin unlock requires both the password AND a special admin header
-  const authHeader = request.headers.get("X-API-Password") || "";
-  const adminHeader = request.headers.get("X-Admin-Unlock") || "";
+  // Admin unlock requires a separate admin secret (not the user password)
+  const adminHeader = request.headers.get("X-Admin-Secret") || "";
 
-  if (
-    !timingSafeEqual(authHeader, env.API_PASSWORD) ||
-    adminHeader !== "true"
-  ) {
+  if (!timingSafeEqual(adminHeader, env.ADMIN_SECRET)) {
     return jsonResponse(
       { error: "Unauthorized" },
       401,
@@ -336,7 +333,7 @@ export default {
         headers: {
           ...corsHeaders(origin, env.ALLOWED_ORIGINS),
           "Access-Control-Allow-Headers":
-            "Content-Type, X-API-Password, X-Admin-Unlock",
+            "Content-Type, X-API-Password, X-Admin-Secret",
         },
       });
     }
