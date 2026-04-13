@@ -1,0 +1,296 @@
+import "./style.css";
+import { transcribeFile } from "./api.ts";
+import type { TranscriptResult } from "./api.ts";
+
+interface FileEntry {
+  file: File;
+  status: "queued" | "processing" | "done" | "error";
+  result?: TranscriptResult;
+  error?: string;
+}
+
+const state: {
+  files: FileEntry[];
+  isProcessing: boolean;
+} = {
+  files: [],
+  isProcessing: false,
+};
+
+// DOM elements
+const dropZone = document.getElementById("drop-zone")!;
+const fileInput = document.getElementById("file-input") as HTMLInputElement;
+const fileList = document.getElementById("file-list")!;
+const fileCount = document.getElementById("file-count")!;
+const fileItems = document.getElementById("file-items")!;
+const clearFiles = document.getElementById("clear-files")!;
+const addMore = document.getElementById("add-more")!;
+const transcribeBtn = document.getElementById("transcribe-btn") as HTMLButtonElement;
+const progressSection = document.getElementById("progress-section")!;
+const progressText = document.getElementById("progress-text")!;
+const progressCount = document.getElementById("progress-count")!;
+const progressBar = document.getElementById("progress-bar")!;
+const currentFileEl = document.getElementById("current-file")!;
+const errorMsg = document.getElementById("error-msg")!;
+const resultsSection = document.getElementById("results-section")!;
+const resultsList = document.getElementById("results-list")!;
+const downloadAll = document.getElementById("download-all")!;
+const languageSelect = document.getElementById("language") as HTMLSelectElement;
+
+// Drop zone events
+dropZone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  dropZone.classList.add("drag-over");
+});
+
+dropZone.addEventListener("dragleave", () => {
+  dropZone.classList.remove("drag-over");
+});
+
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("drag-over");
+  if (e.dataTransfer?.files) {
+    addFiles(Array.from(e.dataTransfer.files));
+  }
+});
+
+fileInput.addEventListener("change", () => {
+  if (fileInput.files) {
+    addFiles(Array.from(fileInput.files));
+    fileInput.value = "";
+  }
+});
+
+clearFiles.addEventListener("click", () => {
+  state.files = [];
+  renderFileList();
+});
+
+addMore.addEventListener("click", () => {
+  fileInput.click();
+});
+
+transcribeBtn.addEventListener("click", startTranscription);
+downloadAll.addEventListener("click", downloadAllTranscripts);
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function addFiles(files: File[]) {
+  const audioVideoTypes = /^(audio|video)\//;
+  const allowedExts =
+    /\.(mp3|wav|m4a|mp4|webm|ogg|flac|aac|wma|opus|avi|mkv|mov|ts)$/i;
+
+  for (const file of files) {
+    if (audioVideoTypes.test(file.type) || allowedExts.test(file.name)) {
+      state.files.push({ file, status: "queued" });
+    }
+  }
+  renderFileList();
+}
+
+function renderFileList() {
+  if (state.files.length === 0) {
+    fileList.hidden = true;
+    dropZone.classList.remove("has-files");
+    transcribeBtn.disabled = true;
+    return;
+  }
+
+  fileList.hidden = false;
+  dropZone.classList.add("has-files");
+  transcribeBtn.disabled = state.isProcessing;
+
+  fileCount.textContent = `${state.files.length} file${state.files.length !== 1 ? "s" : ""} selected`;
+
+  fileItems.innerHTML = state.files
+    .map(
+      (entry, _i) => `
+    <li>
+      <span class="file-name">${escapeHtml(entry.file.name)}</span>
+      <span class="file-size">${formatSize(entry.file.size)}</span>
+      <span class="file-status ${entry.status}">${statusLabel(entry.status)}</span>
+    </li>
+  `,
+    )
+    .join("");
+}
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case "queued":
+      return "Queued";
+    case "processing":
+      return '<span class="spinner-inline"></span>Processing';
+    case "done":
+      return "Done";
+    case "error":
+      return "Failed";
+    default:
+      return "";
+  }
+}
+
+function escapeHtml(str: string): string {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+async function startTranscription() {
+  if (state.files.length === 0 || state.isProcessing) return;
+
+  state.isProcessing = true;
+  transcribeBtn.disabled = true;
+  errorMsg.hidden = true;
+  progressSection.hidden = false;
+  resultsSection.hidden = true;
+  resultsList.innerHTML = "";
+
+  const language = languageSelect.value;
+  const total = state.files.length;
+  let completed = 0;
+
+  // Reset all statuses
+  for (const entry of state.files) {
+    entry.status = "queued";
+    entry.result = undefined;
+    entry.error = undefined;
+  }
+  renderFileList();
+
+  for (let idx = 0; idx < state.files.length; idx++) {
+    const entry = state.files[idx];
+    entry.status = "processing";
+    renderFileList();
+
+    progressText.textContent = "Transcribing...";
+    progressCount.textContent = `${completed}/${total}`;
+    progressBar.style.width = `${(completed / total) * 100}%`;
+    currentFileEl.textContent = entry.file.name;
+
+    try {
+      entry.result = await transcribeFile(entry.file, language);
+      entry.status = "done";
+      completed++;
+      addResultCard(entry, idx);
+    } catch (err) {
+      entry.status = "error";
+      entry.error = err instanceof Error ? err.message : "Unknown error";
+      completed++;
+    }
+
+    renderFileList();
+    progressCount.textContent = `${completed}/${total}`;
+    progressBar.style.width = `${(completed / total) * 100}%`;
+  }
+
+  progressText.textContent = "Complete!";
+  currentFileEl.textContent = "";
+  state.isProcessing = false;
+  transcribeBtn.disabled = false;
+
+  // Show results if any succeeded
+  const successCount = state.files.filter((f) => f.status === "done").length;
+  if (successCount > 0) {
+    resultsSection.hidden = false;
+    downloadAll.style.display = successCount > 1 ? "" : "none";
+  }
+
+  // Show errors
+  const errors = state.files.filter((f) => f.status === "error");
+  if (errors.length > 0) {
+    errorMsg.hidden = false;
+    errorMsg.textContent = `${errors.length} file(s) failed: ${errors.map((e) => e.file.name).join(", ")}`;
+  }
+}
+
+function addResultCard(entry: FileEntry, index: number) {
+  if (!entry.result) return;
+
+  const card = document.createElement("div");
+  card.className = "result-card expanded";
+  card.innerHTML = `
+    <div class="result-card-header" data-index="${index}">
+      <span class="result-card-title">${escapeHtml(entry.file.name)}</span>
+      <div class="result-card-meta">
+        <span class="lang-badge">${entry.result.language}</span>
+        <span class="expand-icon">&#9660;</span>
+      </div>
+    </div>
+    <div class="result-card-body">
+      <textarea readonly>${escapeHtml(entry.result.transcript)}</textarea>
+      <div class="result-card-actions">
+        <button class="btn-secondary copy-btn" data-index="${index}">Copy</button>
+        <button class="btn-secondary download-btn" data-index="${index}">Download .txt</button>
+      </div>
+    </div>
+  `;
+
+  // Toggle expand
+  card.querySelector(".result-card-header")!.addEventListener("click", () => {
+    card.classList.toggle("expanded");
+  });
+
+  // Copy
+  card.querySelector(".copy-btn")!.addEventListener("click", () => {
+    navigator.clipboard.writeText(entry.result!.transcript);
+    const btn = card.querySelector(".copy-btn") as HTMLButtonElement;
+    btn.textContent = "Copied!";
+    setTimeout(() => (btn.textContent = "Copy"), 2000);
+  });
+
+  // Download
+  card.querySelector(".download-btn")!.addEventListener("click", () => {
+    downloadTranscript(entry.file.name, entry.result!.transcript);
+  });
+
+  resultsList.appendChild(card);
+}
+
+function downloadTranscript(filename: string, text: string) {
+  const baseName = filename.replace(/\.[^.]+$/, "");
+  const blob = new Blob([text], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${baseName}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function downloadAllTranscripts() {
+  const completed = state.files.filter(
+    (f) => f.status === "done" && f.result,
+  );
+  if (completed.length === 0) return;
+
+  // If only one file, just download it directly
+  if (completed.length === 1) {
+    downloadTranscript(
+      completed[0].file.name,
+      completed[0].result!.transcript,
+    );
+    return;
+  }
+
+  // For multiple files, create a combined text file with separators
+  const combined = completed
+    .map((entry) => {
+      const baseName = entry.file.name.replace(/\.[^.]+$/, "");
+      return `=== ${baseName} ===\n\n${entry.result!.transcript}`;
+    })
+    .join("\n\n\n");
+
+  const blob = new Blob([combined], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "transcriptions.txt";
+  a.click();
+  URL.revokeObjectURL(url);
+}

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Transcriptor — Free Audio & Video Transcription</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Transcriptor</h1>
+        <p class="subtitle">Transcribe audio & video files. Fast, accurate, supports 99 languages.</p>
+      </header>
+
+      <main>
+        <!-- Settings -->
+        <div class="settings-row">
+          <div class="setting">
+            <label for="language">Language</label>
+            <select id="language">
+              <option value="auto" selected>Auto-detect</option>
+              <option value="en">English</option>
+              <option value="he">Hebrew</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="it">Italian</option>
+              <option value="pt">Portuguese</option>
+              <option value="ru">Russian</option>
+              <option value="zh">Chinese</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="ar">Arabic</option>
+              <option value="hi">Hindi</option>
+              <option value="nl">Dutch</option>
+              <option value="pl">Polish</option>
+              <option value="tr">Turkish</option>
+              <option value="uk">Ukrainian</option>
+              <option value="vi">Vietnamese</option>
+              <option value="th">Thai</option>
+              <option value="id">Indonesian</option>
+              <option value="sv">Swedish</option>
+              <option value="da">Danish</option>
+              <option value="fi">Finnish</option>
+              <option value="no">Norwegian</option>
+              <option value="el">Greek</option>
+              <option value="cs">Czech</option>
+              <option value="ro">Romanian</option>
+              <option value="hu">Hungarian</option>
+              <option value="yi">Yiddish</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Upload Zone -->
+        <div id="drop-zone" class="drop-zone">
+          <div class="drop-zone-content">
+            <div class="drop-icon">📁</div>
+            <p>Drop audio or video files here, or click to browse</p>
+            <span class="drop-hint">Supports MP3, WAV, M4A, MP4, WebM, OGG, FLAC, and more</span>
+          </div>
+          <input type="file" id="file-input" multiple accept="audio/*,video/*,.mp3,.wav,.m4a,.mp4,.webm,.ogg,.flac,.aac,.wma,.opus,.avi,.mkv,.mov" />
+        </div>
+
+        <!-- File List -->
+        <div id="file-list" class="file-list" hidden>
+          <div class="file-list-header">
+            <span id="file-count">0 files selected</span>
+            <button id="clear-files" class="btn-text">Clear all</button>
+          </div>
+          <ul id="file-items"></ul>
+          <button id="add-more" class="btn-text">+ Add more files</button>
+        </div>
+
+        <!-- Transcribe Button -->
+        <button id="transcribe-btn" class="btn-primary" disabled>Transcribe</button>
+
+        <!-- Progress -->
+        <div id="progress-section" class="progress-section" hidden>
+          <div class="progress-header">
+            <span id="progress-text">Processing...</span>
+            <span id="progress-count">0/0</span>
+          </div>
+          <div class="progress-bar-track">
+            <div id="progress-bar" class="progress-bar-fill"></div>
+          </div>
+          <div id="current-file" class="current-file"></div>
+        </div>
+
+        <!-- Error -->
+        <div id="error-msg" class="error-msg" hidden></div>
+
+        <!-- Results -->
+        <div id="results-section" class="results-section" hidden>
+          <div class="results-header">
+            <h2>Transcriptions</h2>
+            <div class="results-actions">
+              <button id="download-all" class="btn-secondary">Download All (.zip)</button>
+            </div>
+          </div>
+          <div id="results-list"></div>
+        </div>
+      </main>
+
+      <footer>
+        <p>Powered by <a href="https://openai.com/research/whisper" target="_blank" rel="noopener">Whisper</a> large-v3. Your files are processed securely and not stored.</p>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

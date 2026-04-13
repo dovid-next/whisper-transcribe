@@ -1,0 +1,78 @@
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8787";
+
+export interface TranscriptResult {
+  transcript: string;
+  language: string;
+  segments?: Array<{ start: number; end: number; text: string }>;
+}
+
+interface TranscribeResponse {
+  transcript?: string;
+  language?: string;
+  segments?: Array<{ start: number; end: number; text: string }>;
+  jobId?: string;
+  status?: string;
+  error?: string;
+}
+
+export async function transcribeFile(
+  file: File,
+  language: string,
+): Promise<TranscriptResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("language", language);
+
+  const response = await fetch(`${API_BASE}/transcribe`, {
+    method: "POST",
+    body: formData,
+  });
+
+  const data: TranscribeResponse = await response.json();
+
+  if (data.error) {
+    throw new Error(data.error);
+  }
+
+  // If we got a direct result (Replicate's "Prefer: wait" worked)
+  if (data.transcript) {
+    return {
+      transcript: data.transcript,
+      language: data.language || "unknown",
+      segments: data.segments,
+    };
+  }
+
+  // Otherwise, poll for the result
+  if (data.jobId) {
+    return pollForResult(data.jobId);
+  }
+
+  throw new Error("Unexpected response from server");
+}
+
+async function pollForResult(jobId: string): Promise<TranscriptResult> {
+  const maxAttempts = 120; // 10 minutes max
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+
+    const response = await fetch(`${API_BASE}/status/${jobId}`);
+    const data: TranscribeResponse = await response.json();
+
+    if (data.status === "succeeded" && data.transcript) {
+      return {
+        transcript: data.transcript,
+        language: data.language || "unknown",
+        segments: data.segments,
+      };
+    }
+
+    if (data.status === "failed") {
+      throw new Error(data.error || "Transcription failed");
+    }
+
+    // Still processing, continue polling
+  }
+
+  throw new Error("Transcription timed out");
+}
