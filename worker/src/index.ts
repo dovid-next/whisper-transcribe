@@ -547,11 +547,9 @@ export default {
         origin,
         env.ALLOWED_ORIGINS,
       );
-    } catch (err) {
-      const debug = err instanceof Error ? err.message : String(err);
-      console.error("Worker error:", debug);
+    } catch (_err) {
       return jsonResponse(
-        { error: "Internal server error", debug },
+        { error: "Internal server error" },
         500,
         origin,
         env.ALLOWED_ORIGINS,
