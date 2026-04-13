@@ -10,9 +10,16 @@ interface ReplicatePrediction {
   id: string;
   status: "starting" | "processing" | "succeeded" | "failed" | "canceled";
   output?: {
-    transcription: string;
-    detected_language: string;
-    segments: Array<{
+    // incredibly-fast-whisper format
+    text?: string;
+    chunks?: Array<{
+      timestamp: [number, number];
+      text: string;
+    }>;
+    // standard whisper format
+    transcription?: string;
+    detected_language?: string;
+    segments?: Array<{
       start: number;
       end: number;
       text: string;
@@ -28,8 +35,9 @@ interface LockoutState {
   lastFailureIp: string;
 }
 
+// incredibly-fast-whisper: ~10x faster than standard whisper, same large-v3 quality
 const WHISPER_MODEL_VERSION =
-  "8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e";
+  "3ab86df6c8f54c11309d4d1f930ac292bad43ace52d10c80d87eb258b3c9f79c";
 
 const MAX_ATTEMPTS = 3;
 const LOCKOUT_KEY = "password_lockout";
@@ -223,10 +231,8 @@ async function createPrediction(
 
   const input: Record<string, unknown> = {
     audio: dataUri,
-    model: "large-v3",
-    transcription: "plain text",
-    translate: false,
-    temperature: 0,
+    task: "transcribe",
+    batch_size: 64,
   };
 
   if (language && language !== "auto") {
@@ -257,10 +263,8 @@ async function createPredictionFromUrl(
 ): Promise<ReplicatePrediction> {
   const input: Record<string, unknown> = {
     audio: audioUrl,
-    model: "large-v3",
-    transcription: "plain text",
-    translate: false,
-    temperature: 0,
+    task: "transcribe",
+    batch_size: 64,
   };
 
   if (language && language !== "auto") {
@@ -282,6 +286,35 @@ async function createPredictionFromUrl(
   }
 
   return response.json();
+}
+
+function extractResult(output: ReplicatePrediction["output"]): {
+  transcript: string;
+  language: string;
+  segments: Array<{ start: number; end: number; text: string }>;
+} | null {
+  if (!output) return null;
+  // incredibly-fast-whisper: { text, chunks }
+  if (output.text !== undefined) {
+    return {
+      transcript: output.text,
+      language: "auto-detected",
+      segments: (output.chunks || []).map((c) => ({
+        start: c.timestamp[0],
+        end: c.timestamp[1],
+        text: c.text,
+      })),
+    };
+  }
+  // standard whisper: { transcription, detected_language, segments }
+  if (output.transcription !== undefined) {
+    return {
+      transcript: output.transcription,
+      language: output.detected_language || "unknown",
+      segments: output.segments || [],
+    };
+  }
+  return null;
 }
 
 async function getPrediction(
@@ -419,17 +452,9 @@ export default {
           );
         }
 
-        if (prediction.status === "succeeded" && prediction.output) {
-          return jsonResponse(
-            {
-              transcript: prediction.output.transcription,
-              language: prediction.output.detected_language,
-              segments: prediction.output.segments,
-            },
-            200,
-            origin,
-            env.ALLOWED_ORIGINS,
-          );
+        const result = extractResult(prediction.output);
+        if (prediction.status === "succeeded" && result) {
+          return jsonResponse(result, 200, origin, env.ALLOWED_ORIGINS);
         } else if (prediction.status === "failed") {
           return jsonResponse(
             { error: "Transcription failed" },
@@ -460,15 +485,11 @@ export default {
         }
 
         const prediction = await getPrediction(jobId, env.REPLICATE_API_TOKEN);
+        const result = extractResult(prediction.output);
 
-        if (prediction.status === "succeeded" && prediction.output) {
+        if (prediction.status === "succeeded" && result) {
           return jsonResponse(
-            {
-              status: "succeeded",
-              transcript: prediction.output.transcription,
-              language: prediction.output.detected_language,
-              segments: prediction.output.segments,
-            },
+            { status: "succeeded", ...result },
             200,
             origin,
             env.ALLOWED_ORIGINS,
