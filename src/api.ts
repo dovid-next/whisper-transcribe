@@ -18,6 +18,7 @@ interface TranscribeResponse {
 export async function transcribeFile(
   file: File,
   language: string,
+  password: string,
 ): Promise<TranscriptResult> {
   const formData = new FormData();
   formData.append("file", file);
@@ -25,6 +26,9 @@ export async function transcribeFile(
 
   const response = await fetch(`${API_BASE}/transcribe`, {
     method: "POST",
+    headers: {
+      "X-API-Password": password,
+    },
     body: formData,
   });
 

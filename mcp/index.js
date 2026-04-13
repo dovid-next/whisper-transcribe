@@ -7,10 +7,12 @@ import {
 import fs from "fs";
 import path from "path";
 
-// Configuration — set your Worker URL here or via environment variable
+// Configuration — set your Worker URL and password here or via environment variables
 const API_URL =
   process.env.TRANSCRIPTOR_API_URL ||
   "https://transcriptor-api.dovid-b43.workers.dev";
+const API_PASSWORD =
+  process.env.TRANSCRIPTOR_PASSWORD || "transcribe2026";
 
 const server = new Server(
   { name: "transcriptor", version: "1.0.0" },
@@ -139,6 +141,7 @@ async function transcribeFile(filePath, language = "auto") {
     method: "POST",
     headers: {
       "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      "X-API-Password": API_PASSWORD,
     },
     body,
   });
@@ -160,7 +163,7 @@ async function transcribeFile(filePath, language = "auto") {
 async function transcribeUrl(url, language = "auto") {
   const response = await fetch(`${API_URL}/transcribe`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-API-Password": API_PASSWORD },
     body: JSON.stringify({ url, language }),
   });
 

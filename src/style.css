@@ -68,6 +68,46 @@ header h1 {
   flex: 1;
 }
 
+/* Password gate */
+.password-gate {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow);
+}
+
+.password-gate input[type="password"] {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.password-gate input[type="password"]:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.password-gate.unlocked {
+  border-color: var(--primary);
+  background: var(--primary-light);
+}
+
+.app-locked .settings-row,
+.app-locked .drop-zone,
+.app-locked .file-list,
+.app-locked .btn-primary {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 .setting label {
   display: block;
   font-size: 13px;

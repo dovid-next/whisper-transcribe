@@ -1,6 +1,7 @@
 interface Env {
   REPLICATE_API_TOKEN: string;
   ALLOWED_ORIGINS: string;
+  API_PASSWORD: string;
 }
 
 interface ReplicatePrediction {
@@ -25,7 +26,7 @@ function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
   return {
     "Access-Control-Allow-Origin": allowedOrigins === "*" ? "*" : origin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-API-Password",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -168,6 +169,19 @@ export default {
       return new Response(null, {
         headers: corsHeaders(origin, env.ALLOWED_ORIGINS),
       });
+    }
+
+    // Authenticate all POST requests
+    if (request.method === "POST") {
+      const authHeader = request.headers.get("X-API-Password") || "";
+      if (authHeader !== env.API_PASSWORD) {
+        return jsonResponse(
+          { error: "Unauthorized" },
+          401,
+          origin,
+          env.ALLOWED_ORIGINS,
+        );
+      }
     }
 
     try {

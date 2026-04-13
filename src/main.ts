@@ -12,9 +12,11 @@ interface FileEntry {
 const state: {
   files: FileEntry[];
   isProcessing: boolean;
+  password: string;
 } = {
   files: [],
   isProcessing: false,
+  password: "",
 };
 
 // DOM elements
@@ -36,6 +38,40 @@ const resultsSection = document.getElementById("results-section")!;
 const resultsList = document.getElementById("results-list")!;
 const downloadAll = document.getElementById("download-all")!;
 const languageSelect = document.getElementById("language") as HTMLSelectElement;
+const passwordInput = document.getElementById("password") as HTMLInputElement;
+const unlockBtn = document.getElementById("unlock-btn")!;
+const passwordGate = document.getElementById("password-gate")!;
+const appEl = document.getElementById("app")!;
+
+// Start locked
+appEl.classList.add("app-locked");
+
+// Check for saved password
+const savedPassword = localStorage.getItem("transcriptor-password");
+if (savedPassword) {
+  state.password = savedPassword;
+  appEl.classList.remove("app-locked");
+  passwordGate.classList.add("unlocked");
+  passwordInput.value = "••••••••";
+  unlockBtn.textContent = "Unlocked";
+}
+
+// Password unlock
+unlockBtn.addEventListener("click", () => {
+  const pw = passwordInput.value.trim();
+  if (pw && pw !== "••••••••") {
+    state.password = pw;
+    localStorage.setItem("transcriptor-password", pw);
+    appEl.classList.remove("app-locked");
+    passwordGate.classList.add("unlocked");
+    passwordInput.value = "••••••••";
+    unlockBtn.textContent = "Unlocked";
+  }
+});
+
+passwordInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") unlockBtn.click();
+});
 
 // Drop zone events
 dropZone.addEventListener("dragover", (e) => {
@@ -174,7 +210,7 @@ async function startTranscription() {
     currentFileEl.textContent = entry.file.name;
 
     try {
-      entry.result = await transcribeFile(entry.file, language);
+      entry.result = await transcribeFile(entry.file, language, state.password);
       entry.status = "done";
       completed++;
       addResultCard(entry, idx);
