@@ -1,5 +1,5 @@
 import "./style.css";
-import { transcribeFile } from "./api.ts";
+import { transcribeFile, cancelTranscription } from "./api.ts";
 import type { TranscriptResult } from "./api.ts";
 
 interface FileEntry {
@@ -12,10 +12,12 @@ interface FileEntry {
 const state: {
   files: FileEntry[];
   isProcessing: boolean;
+  cancelled: boolean;
   password: string;
 } = {
   files: [],
   isProcessing: false,
+  cancelled: false,
   password: "",
 };
 
@@ -107,7 +109,16 @@ addMore.addEventListener("click", () => {
   fileInput.click();
 });
 
-transcribeBtn.addEventListener("click", startTranscription);
+transcribeBtn.addEventListener("click", () => {
+  if (state.isProcessing) {
+    state.cancelled = true;
+    cancelTranscription();
+    transcribeBtn.textContent = "Cancelling...";
+    transcribeBtn.disabled = true;
+  } else {
+    startTranscription();
+  }
+});
 downloadAll.addEventListener("click", downloadAllTranscripts);
 
 function formatSize(bytes: number): string {
@@ -181,7 +192,9 @@ async function startTranscription() {
   if (state.files.length === 0 || state.isProcessing) return;
 
   state.isProcessing = true;
-  transcribeBtn.disabled = true;
+  state.cancelled = false;
+  transcribeBtn.disabled = false;
+  transcribeBtn.textContent = "Cancel";
   errorMsg.hidden = true;
   progressSection.hidden = false;
   resultsSection.hidden = true;
@@ -200,6 +213,8 @@ async function startTranscription() {
   renderFileList();
 
   for (let idx = 0; idx < state.files.length; idx++) {
+    if (state.cancelled) break;
+
     const entry = state.files[idx];
     entry.status = "processing";
     renderFileList();
@@ -244,10 +259,12 @@ async function startTranscription() {
     progressBar.style.width = `${(completed / total) * 100}%`;
   }
 
-  progressText.textContent = "Complete!";
+  progressText.textContent = state.cancelled ? "Cancelled" : "Complete!";
   currentFileEl.textContent = "";
   state.isProcessing = false;
+  state.cancelled = false;
   transcribeBtn.disabled = false;
+  transcribeBtn.textContent = "Transcribe";
 
   // Show results if any succeeded
   const successCount = state.files.filter((f) => f.status === "done").length;

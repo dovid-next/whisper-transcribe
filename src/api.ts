@@ -15,11 +15,24 @@ interface TranscribeResponse {
   error?: string;
 }
 
+// Current AbortController — allows cancelling in-flight requests
+let currentAbortController: AbortController | null = null;
+
+export function cancelTranscription() {
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null;
+  }
+}
+
 export async function transcribeFile(
   file: File,
   language: string,
   password: string,
 ): Promise<TranscriptResult> {
+  currentAbortController = new AbortController();
+  const signal = currentAbortController.signal;
+
   const formData = new FormData();
   formData.append("file", file);
   formData.append("language", language);
@@ -30,6 +43,7 @@ export async function transcribeFile(
       "X-API-Password": password,
     },
     body: formData,
+    signal,
   });
 
   const data: TranscribeResponse & { locked?: boolean; remainingAttempts?: number } = await response.json();
@@ -49,7 +63,6 @@ export async function transcribeFile(
     throw new Error(data.error);
   }
 
-  // If we got a direct result (Replicate's "Prefer: wait" worked)
   if (data.transcript) {
     return {
       transcript: data.transcript,
@@ -58,21 +71,23 @@ export async function transcribeFile(
     };
   }
 
-  // Otherwise, poll for the result
   if (data.jobId) {
-    return pollForResult(data.jobId, password);
+    return pollForResult(data.jobId, password, signal);
   }
 
   throw new Error("Unexpected response from server");
 }
 
-async function pollForResult(jobId: string, password: string): Promise<TranscriptResult> {
-  const maxAttempts = 120; // 10 minutes max
+async function pollForResult(jobId: string, password: string, signal: AbortSignal): Promise<TranscriptResult> {
+  const maxAttempts = 120;
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, 5000));
 
+    if (signal.aborted) throw new Error("Cancelled");
+
     const response = await fetch(`${API_BASE}/status/${jobId}`, {
       headers: { "X-API-Password": password },
+      signal,
     });
     const data: TranscribeResponse = await response.json();
 
@@ -87,8 +102,6 @@ async function pollForResult(jobId: string, password: string): Promise<Transcrip
     if (data.status === "failed") {
       throw new Error(data.error || "Transcription failed");
     }
-
-    // Still processing, continue polling
   }
 
   throw new Error("Transcription timed out");
