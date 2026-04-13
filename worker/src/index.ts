@@ -19,8 +19,7 @@ interface ReplicatePrediction {
 }
 
 const WHISPER_MODEL_VERSION =
-  "cdd97b257f93cb89dede1c7584df3f180dobd0f37c82a36c7f61ac962227ab2c";
-const WHISPER_MODEL = "openai/whisper";
+  "8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e";
 
 function corsHeaders(origin: string, allowedOrigins: string): HeadersInit {
   return {
@@ -95,7 +94,7 @@ async function createPrediction(
       Prefer: "wait",
     },
     body: JSON.stringify({
-      model: WHISPER_MODEL,
+      version: WHISPER_MODEL_VERSION,
       input,
     }),
   });
@@ -133,7 +132,7 @@ async function createPredictionFromUrl(
       Prefer: "wait",
     },
     body: JSON.stringify({
-      model: WHISPER_MODEL,
+      version: WHISPER_MODEL_VERSION,
       input,
     }),
   });
