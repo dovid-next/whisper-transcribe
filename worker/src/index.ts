@@ -255,7 +255,7 @@ async function createPrediction(
   const input: Record<string, unknown> = {
     audio: dataUri,
     task: "transcribe",
-    batch_size: 64,
+    batch_size: 24,
   };
 
   if (language && language !== "auto") {
@@ -288,7 +288,7 @@ async function createPredictionFromUrl(
   const input: Record<string, unknown> = {
     audio: audioUrl,
     task: "transcribe",
-    batch_size: 64,
+    batch_size: 24,
   };
 
   if (language && language !== "auto") {
