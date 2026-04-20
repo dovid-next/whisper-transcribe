@@ -4,7 +4,15 @@ interface Env {
   API_PASSWORD: string;
   ADMIN_SECRET: string;
   GOOGLE_CLOUD_API_KEY?: string;
+  GOOGLE_SERVICE_ACCOUNT?: string; // JSON string of service account key
+  GOOGLE_GCS_BUCKET?: string;
   PIN_SECURITY: KVNamespace;
+}
+
+interface ServiceAccount {
+  client_email: string;
+  private_key: string;
+  project_id: string;
 }
 
 interface ReplicatePrediction {
@@ -354,7 +362,308 @@ async function createPredictionFromUrl(
   return response.json();
 }
 
-// --- Google Cloud Speech-to-Text ---
+// --- Google Cloud service account auth (for GCS + long-running recognize) ---
+
+function base64UrlEncode(data: ArrayBuffer | Uint8Array | string): string {
+  let bytes: Uint8Array;
+  if (typeof data === "string") {
+    bytes = new TextEncoder().encode(data);
+  } else if (data instanceof ArrayBuffer) {
+    bytes = new Uint8Array(data);
+  } else {
+    bytes = data;
+  }
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function parseServiceAccount(json: string): ServiceAccount {
+  const sa = JSON.parse(json);
+  return {
+    client_email: sa.client_email,
+    private_key: sa.private_key,
+    project_id: sa.project_id,
+  };
+}
+
+async function createJWT(sa: ServiceAccount, scope: string): Promise<string> {
+  const header = { alg: "RS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: sa.client_email,
+    scope,
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const encHeader = base64UrlEncode(JSON.stringify(header));
+  const encPayload = base64UrlEncode(JSON.stringify(payload));
+  const unsigned = `${encHeader}.${encPayload}`;
+
+  const pemBody = sa.private_key
+    .replace(/-----BEGIN PRIVATE KEY-----/, "")
+    .replace(/-----END PRIVATE KEY-----/, "")
+    .replace(/\s/g, "");
+  const keyBuffer = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    keyBuffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(unsigned),
+  );
+
+  return `${unsigned}.${base64UrlEncode(signature)}`;
+}
+
+async function getAccessToken(sa: ServiceAccount): Promise<string> {
+  const jwt = await createJWT(
+    sa,
+    "https://www.googleapis.com/auth/cloud-platform",
+  );
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`OAuth token error: ${err.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { access_token: string };
+  return data.access_token;
+}
+
+// --- Google Cloud Storage ---
+
+async function uploadToGCS(
+  token: string,
+  bucket: string,
+  objectName: string,
+  data: ArrayBuffer,
+  contentType: string,
+): Promise<string> {
+  const url = `https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=${encodeURIComponent(objectName)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": contentType,
+    },
+    body: data,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`GCS upload ${res.status}: ${err.slice(0, 200)}`);
+  }
+  return `gs://${bucket}/${objectName}`;
+}
+
+async function deleteFromGCS(
+  token: string,
+  bucket: string,
+  objectName: string,
+): Promise<void> {
+  try {
+    await fetch(
+      `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(objectName)}`,
+      { method: "DELETE", headers: { Authorization: `Bearer ${token}` } },
+    );
+  } catch {
+    // Best effort — don't fail the request if cleanup fails
+  }
+}
+
+// --- Google Cloud Speech long-running recognize ---
+
+interface GoogleOperation {
+  name: string;
+  done?: boolean;
+  error?: { code?: number; message?: string };
+  response?: {
+    results?: GoogleSpeechResponse["results"];
+  };
+}
+
+function buildGoogleSpeechConfig(
+  fileName: string,
+  language: string | null,
+  context: string,
+): Record<string, unknown> {
+  const ext = fileName.split(".").pop()?.toLowerCase() || "mp3";
+  const encodingMap: Record<string, string> = {
+    mp3: "MP3",
+    wav: "LINEAR16",
+    flac: "FLAC",
+    opus: "OGG_OPUS",
+    ogg: "OGG_OPUS",
+    webm: "WEBM_OPUS",
+  };
+  const encoding = encodingMap[ext] || "ENCODING_UNSPECIFIED";
+
+  const langMap: Record<string, string> = {
+    en: "en-US", he: "iw-IL", es: "es-ES", fr: "fr-FR", de: "de-DE",
+    it: "it-IT", pt: "pt-BR", ru: "ru-RU", zh: "zh-CN", ja: "ja-JP",
+    ko: "ko-KR", ar: "ar-SA", hi: "hi-IN", nl: "nl-NL", pl: "pl-PL",
+    tr: "tr-TR", uk: "uk-UA", vi: "vi-VN", th: "th-TH", id: "id-ID",
+    sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "no-NO", el: "el-GR",
+    cs: "cs-CZ", ro: "ro-RO", hu: "hu-HU",
+  };
+  const languageCode = language && language !== "auto"
+    ? (langMap[language] || language)
+    : "en-US";
+
+  const config: Record<string, unknown> = {
+    encoding,
+    languageCode,
+    enableAutomaticPunctuation: true,
+    enableWordTimeOffsets: true,
+    model: "latest_long",
+    diarizationConfig: {
+      enableSpeakerDiarization: true,
+      minSpeakerCount: 2,
+      maxSpeakerCount: 6,
+    },
+  };
+
+  if (context.trim()) {
+    const phrases = context
+      .split(/[\n,]+/)
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0 && p.length < 100)
+      .slice(0, 500);
+    if (phrases.length > 0) {
+      config.speechContexts = [{ phrases, boost: 15 }];
+    }
+  }
+
+  return config;
+}
+
+async function startGoogleLongRunning(
+  token: string,
+  gcsUri: string,
+  config: Record<string, unknown>,
+): Promise<string> {
+  const res = await fetch(
+    "https://speech.googleapis.com/v1/speech:longrunningrecognize",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        config,
+        audio: { uri: gcsUri },
+      }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Google Speech ${res.status}: ${err.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { name: string };
+  return data.name;
+}
+
+async function checkGoogleOperation(
+  token: string,
+  operationName: string,
+): Promise<GoogleOperation> {
+  const res = await fetch(
+    `https://speech.googleapis.com/v1/operations/${operationName}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  return res.json();
+}
+
+function googleResultsToTranscript(results: GoogleSpeechResponse["results"]): {
+  transcript: string;
+  language: string;
+  segments: Array<{ start: number; end: number; text: string }>;
+} {
+  const allWords: Array<{
+    word: string;
+    speaker: number;
+    start: number;
+    end: number;
+  }> = [];
+
+  for (const result of results || []) {
+    const alt = result.alternatives?.[0];
+    if (alt?.words) {
+      for (const w of alt.words) {
+        allWords.push({
+          word: w.word,
+          speaker: w.speakerTag || 0,
+          start: parseFloat((w.startTime || "0s").replace("s", "")),
+          end: parseFloat((w.endTime || "0s").replace("s", "")),
+        });
+      }
+    }
+  }
+
+  const segs: Array<{ start: number; end: number; text: string; speaker: number }> = [];
+  let cur: { start: number; end: number; text: string; speaker: number } | null = null;
+  for (const w of allWords) {
+    if (!cur || cur.speaker !== w.speaker) {
+      if (cur) segs.push(cur);
+      cur = { start: w.start, end: w.end, text: w.word, speaker: w.speaker };
+    } else {
+      cur.text += " " + w.word;
+      cur.end = w.end;
+    }
+  }
+  if (cur) segs.push(cur);
+
+  const transcript = segs
+    .map((s) => (s.speaker > 0 ? `Speaker ${s.speaker}: ${s.text}` : s.text))
+    .join("\n\n");
+
+  const fallback = (results || [])
+    .map((r) => r.alternatives?.[0]?.transcript || "")
+    .filter(Boolean)
+    .join(" ");
+
+  const languageCode = (results && results[0]?.languageCode) || "unknown";
+
+  return {
+    transcript: transcript || fallback,
+    language: languageCode,
+    segments: segs.map((s) => ({ start: s.start, end: s.end, text: s.text })),
+  };
+}
+
+// Encode a Google job into a single opaque jobId so the client can poll.
+// Contains operation name + GCS object so we can clean up after polling.
+function encodeGoogleJobId(operationName: string, gcsObject: string): string {
+  const payload = JSON.stringify({ op: operationName, obj: gcsObject });
+  return "gcp_" + base64UrlEncode(payload);
+}
+
+function decodeGoogleJobId(jobId: string): { op: string; obj: string } | null {
+  if (!jobId.startsWith("gcp_")) return null;
+  try {
+    const b64 = jobId.slice(4).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = atob(padded);
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+// --- Google Cloud Speech-to-Text (sync inline, <10MB files only) ---
 
 interface GoogleSpeechResponse {
   results?: Array<{
@@ -642,30 +951,76 @@ export default {
 
           // Google Cloud provider
           if (provider === "google") {
-            if (!env.GOOGLE_CLOUD_API_KEY) {
+            // Path A: small files (<10MB) — inline sync recognize via API key
+            if (file.size <= 10 * 1024 * 1024 && env.GOOGLE_CLOUD_API_KEY) {
+              const gResult = await transcribeWithGoogle(
+                arrayBuffer,
+                file.name,
+                language,
+                env.GOOGLE_CLOUD_API_KEY,
+                context,
+              );
+              return jsonResponse(gResult, 200, origin, env.ALLOWED_ORIGINS);
+            }
+
+            // Path B: larger files — upload to GCS, start long-running recognize
+            if (!env.GOOGLE_SERVICE_ACCOUNT || !env.GOOGLE_GCS_BUCKET) {
               return jsonResponse(
-                { error: "Google Cloud provider is not configured. Contact admin." },
+                { error: "Google Cloud large-file path is not configured. Contact admin." },
                 400,
                 origin,
                 env.ALLOWED_ORIGINS,
               );
             }
-            if (file.size > 10 * 1024 * 1024) {
+
+            const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
+            const token = await getAccessToken(sa);
+
+            // Random object name so uploads don't collide
+            const ext = file.name.split(".").pop()?.toLowerCase() || "bin";
+            const uuid = crypto.randomUUID();
+            const objectName = `uploads/${uuid}.${ext}`;
+
+            const mimeMap: Record<string, string> = {
+              mp3: "audio/mpeg",
+              wav: "audio/wav",
+              m4a: "audio/mp4",
+              mp4: "video/mp4",
+              webm: "video/webm",
+              ogg: "audio/ogg",
+              flac: "audio/flac",
+              aac: "audio/aac",
+              opus: "audio/opus",
+            };
+            const contentTypeHeader = mimeMap[ext] || "application/octet-stream";
+
+            const gcsUri = await uploadToGCS(
+              token,
+              env.GOOGLE_GCS_BUCKET,
+              objectName,
+              arrayBuffer,
+              contentTypeHeader,
+            );
+
+            const config = buildGoogleSpeechConfig(file.name, language, context);
+            try {
+              const operationName = await startGoogleLongRunning(
+                token,
+                gcsUri,
+                config,
+              );
+              const jobId = encodeGoogleJobId(operationName, objectName);
               return jsonResponse(
-                { error: "Google Cloud provider only supports files <10MB (~1 min audio). Use Replicate for longer files." },
-                413,
+                { jobId, status: "starting" },
+                202,
                 origin,
                 env.ALLOWED_ORIGINS,
               );
+            } catch (err) {
+              // Clean up GCS on failure to start
+              await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, objectName);
+              throw err;
             }
-            const gResult = await transcribeWithGoogle(
-              arrayBuffer,
-              file.name,
-              language,
-              env.GOOGLE_CLOUD_API_KEY,
-              context,
-            );
-            return jsonResponse(gResult, 200, origin, env.ALLOWED_ORIGINS);
           }
 
           // Replicate provider (default)
@@ -747,7 +1102,62 @@ export default {
       // GET /status/:jobId
       if (url.pathname.startsWith("/status/") && request.method === "GET") {
         const jobId = url.pathname.split("/status/")[1];
-        if (!jobId || !isValidJobId(jobId)) {
+        if (!jobId) {
+          return jsonResponse(
+            { error: "Invalid job ID" },
+            400,
+            origin,
+            env.ALLOWED_ORIGINS,
+          );
+        }
+
+        // Google Cloud long-running operation
+        if (jobId.startsWith("gcp_")) {
+          const decoded = decodeGoogleJobId(jobId);
+          if (!decoded || !env.GOOGLE_SERVICE_ACCOUNT || !env.GOOGLE_GCS_BUCKET) {
+            return jsonResponse(
+              { error: "Invalid Google job ID or provider not configured" },
+              400,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
+
+          const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
+          const token = await getAccessToken(sa);
+          const op = await checkGoogleOperation(token, decoded.op);
+
+          if (op.done) {
+            // Clean up GCS (best effort — always try to delete)
+            await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, decoded.obj);
+
+            if (op.error) {
+              return jsonResponse(
+                { status: "failed", error: op.error.message || "Transcription failed" },
+                200,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+            const gResult = googleResultsToTranscript(op.response?.results);
+            return jsonResponse(
+              { status: "succeeded", ...gResult },
+              200,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
+
+          return jsonResponse(
+            { status: "processing" },
+            200,
+            origin,
+            env.ALLOWED_ORIGINS,
+          );
+        }
+
+        // Replicate prediction
+        if (!isValidJobId(jobId)) {
           return jsonResponse(
             { error: "Invalid job ID" },
             400,
