@@ -3,6 +3,7 @@ interface Env {
   ALLOWED_ORIGINS: string;
   API_PASSWORD: string;
   ADMIN_SECRET: string;
+  GOOGLE_CLOUD_API_KEY?: string;
   PIN_SECURITY: KVNamespace;
 }
 
@@ -35,9 +36,12 @@ interface LockoutState {
   lastFailureIp: string;
 }
 
-// incredibly-fast-whisper: ~10x faster than standard whisper, same large-v3 quality
-const WHISPER_MODEL_VERSION =
+// incredibly-fast-whisper: ~10x faster. Used by default.
+const WHISPER_FAST_VERSION =
   "3ab86df6c8f54c11309d4d1f930ac292bad43ace52d10c80d87eb258b3c9f79c";
+// openai/whisper: standard, supports initial_prompt for context hints.
+const WHISPER_STANDARD_VERSION =
+  "8099696689d249cf8b122d833c36ac3f75505c666a395ca40ef26f68e7d3d16e";
 
 const MAX_ATTEMPTS = 3;
 const LOCKOUT_KEY = "password_lockout";
@@ -219,13 +223,7 @@ async function fetchWithRetry(
   throw new Error("Rate limited: too many retries");
 }
 
-async function createPrediction(
-  fileData: ArrayBuffer,
-  fileName: string,
-  language: string | null,
-  token: string,
-): Promise<ReplicatePrediction> {
-  // Convert in chunks to avoid call stack overflow on large files
+function fileToDataUri(fileData: ArrayBuffer, fileName: string): string {
   const bytes = new Uint8Array(fileData);
   let binary = "";
   const chunkSize = 8192;
@@ -250,13 +248,40 @@ async function createPrediction(
     mov: "video/quicktime",
   };
   const mime = mimeMap[ext] || "audio/mpeg";
-  const dataUri = `data:${mime};base64,${base64}`;
+  return `data:${mime};base64,${base64}`;
+}
 
-  const input: Record<string, unknown> = {
-    audio: dataUri,
-    task: "transcribe",
-    batch_size: 24,
-  };
+async function createPrediction(
+  fileData: ArrayBuffer,
+  fileName: string,
+  language: string | null,
+  token: string,
+  context: string = "",
+): Promise<ReplicatePrediction> {
+  const dataUri = fileToDataUri(fileData, fileName);
+  const hasContext = context.trim().length > 0;
+
+  // If context is provided, use the standard whisper model (supports initial_prompt).
+  // Otherwise, use the incredibly-fast-whisper model (~10x faster).
+  const version = hasContext ? WHISPER_STANDARD_VERSION : WHISPER_FAST_VERSION;
+
+  let input: Record<string, unknown>;
+  if (hasContext) {
+    input = {
+      audio: dataUri,
+      model: "large-v3",
+      transcription: "plain text",
+      translate: false,
+      temperature: 0,
+      initial_prompt: context.trim().slice(0, 500),
+    };
+  } else {
+    input = {
+      audio: dataUri,
+      task: "transcribe",
+      batch_size: 24,
+    };
+  }
 
   if (language && language !== "auto") {
     input.language = language;
@@ -269,7 +294,7 @@ async function createPrediction(
       "Content-Type": "application/json",
       Prefer: "wait",
     },
-    body: JSON.stringify({ version: WHISPER_MODEL_VERSION, input }),
+    body: JSON.stringify({ version, input }),
   });
 
   if (!response.ok) {
@@ -284,12 +309,28 @@ async function createPredictionFromUrl(
   audioUrl: string,
   language: string | null,
   token: string,
+  context: string = "",
 ): Promise<ReplicatePrediction> {
-  const input: Record<string, unknown> = {
-    audio: audioUrl,
-    task: "transcribe",
-    batch_size: 24,
-  };
+  const hasContext = context.trim().length > 0;
+  const version = hasContext ? WHISPER_STANDARD_VERSION : WHISPER_FAST_VERSION;
+
+  let input: Record<string, unknown>;
+  if (hasContext) {
+    input = {
+      audio: audioUrl,
+      model: "large-v3",
+      transcription: "plain text",
+      translate: false,
+      temperature: 0,
+      initial_prompt: context.trim().slice(0, 500),
+    };
+  } else {
+    input = {
+      audio: audioUrl,
+      task: "transcribe",
+      batch_size: 24,
+    };
+  }
 
   if (language && language !== "auto") {
     input.language = language;
@@ -302,7 +343,7 @@ async function createPredictionFromUrl(
       "Content-Type": "application/json",
       Prefer: "wait",
     },
-    body: JSON.stringify({ version: WHISPER_MODEL_VERSION, input }),
+    body: JSON.stringify({ version, input }),
   });
 
   if (!response.ok) {
@@ -311,6 +352,159 @@ async function createPredictionFromUrl(
   }
 
   return response.json();
+}
+
+// --- Google Cloud Speech-to-Text ---
+
+interface GoogleSpeechResponse {
+  results?: Array<{
+    alternatives?: Array<{
+      transcript?: string;
+      words?: Array<{
+        word: string;
+        speakerTag?: number;
+        startTime?: string;
+        endTime?: string;
+      }>;
+    }>;
+    languageCode?: string;
+  }>;
+  error?: { message?: string };
+}
+
+async function transcribeWithGoogle(
+  fileData: ArrayBuffer,
+  fileName: string,
+  language: string | null,
+  apiKey: string,
+  context: string = "",
+): Promise<{ transcript: string; language: string; segments: Array<{ start: number; end: number; text: string }> }> {
+  const bytes = new Uint8Array(fileData);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  const base64 = btoa(binary);
+
+  const ext = fileName.split(".").pop()?.toLowerCase() || "mp3";
+  const encodingMap: Record<string, string> = {
+    mp3: "MP3",
+    wav: "LINEAR16",
+    flac: "FLAC",
+    opus: "OGG_OPUS",
+    ogg: "OGG_OPUS",
+    webm: "WEBM_OPUS",
+  };
+  const encoding = encodingMap[ext] || "ENCODING_UNSPECIFIED";
+
+  // Google expects BCP-47 (e.g., "en-US"). Map some common codes.
+  const langMap: Record<string, string> = {
+    en: "en-US", he: "iw-IL", es: "es-ES", fr: "fr-FR", de: "de-DE",
+    it: "it-IT", pt: "pt-BR", ru: "ru-RU", zh: "zh-CN", ja: "ja-JP",
+    ko: "ko-KR", ar: "ar-SA", hi: "hi-IN", nl: "nl-NL", pl: "pl-PL",
+    tr: "tr-TR", uk: "uk-UA", vi: "vi-VN", th: "th-TH", id: "id-ID",
+    sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "no-NO", el: "el-GR",
+    cs: "cs-CZ", ro: "ro-RO", hu: "hu-HU",
+  };
+  const languageCode = language && language !== "auto" ? (langMap[language] || language) : "en-US";
+
+  const config: Record<string, unknown> = {
+    encoding,
+    languageCode,
+    enableAutomaticPunctuation: true,
+    enableWordTimeOffsets: true,
+    model: "latest_long",
+    diarizationConfig: {
+      enableSpeakerDiarization: true,
+      minSpeakerCount: 2,
+      maxSpeakerCount: 6,
+    },
+  };
+
+  // Phrases bias for context
+  if (context.trim()) {
+    // Split context into phrases by newlines or commas
+    const phrases = context
+      .split(/[\n,]+/)
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0 && p.length < 100)
+      .slice(0, 500);
+    if (phrases.length > 0) {
+      config.speechContexts = [{ phrases, boost: 15 }];
+    }
+  }
+
+  const response = await fetch(
+    `https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        config,
+        audio: { content: base64 },
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Google Cloud ${response.status}: ${errBody.slice(0, 300)}`);
+  }
+
+  const data = (await response.json()) as GoogleSpeechResponse;
+  if (data.error) {
+    throw new Error(`Google Cloud: ${data.error.message || "unknown error"}`);
+  }
+
+  // Build transcript with speaker labels from words
+  const results = data.results || [];
+  const allWords: Array<{ word: string; speaker: number; start: number; end: number }> = [];
+  for (const result of results) {
+    const alt = result.alternatives?.[0];
+    if (alt?.words) {
+      for (const w of alt.words) {
+        allWords.push({
+          word: w.word,
+          speaker: w.speakerTag || 0,
+          start: parseFloat((w.startTime || "0s").replace("s", "")),
+          end: parseFloat((w.endTime || "0s").replace("s", "")),
+        });
+      }
+    }
+  }
+
+  // Group into segments by speaker
+  const segments: Array<{ start: number; end: number; text: string; speaker: number }> = [];
+  let current: { start: number; end: number; text: string; speaker: number } | null = null;
+  for (const w of allWords) {
+    if (!current || current.speaker !== w.speaker) {
+      if (current) segments.push(current);
+      current = { start: w.start, end: w.end, text: w.word, speaker: w.speaker };
+    } else {
+      current.text += " " + w.word;
+      current.end = w.end;
+    }
+  }
+  if (current) segments.push(current);
+
+  // Build final transcript with speaker labels
+  const transcript = segments
+    .map((s) => (s.speaker > 0 ? `Speaker ${s.speaker}: ${s.text}` : s.text))
+    .join("\n\n");
+
+  // Fallback: if no diarization, use simple concat
+  const fallbackTranscript =
+    results
+      .map((r) => r.alternatives?.[0]?.transcript || "")
+      .filter((s) => s)
+      .join(" ");
+
+  return {
+    transcript: transcript || fallbackTranscript,
+    language: results[0]?.languageCode || languageCode,
+    segments: segments.map((s) => ({ start: s.start, end: s.end, text: s.text })),
+  };
 }
 
 function extractResult(output: ReplicatePrediction["output"]): {
@@ -418,12 +612,13 @@ export default {
       // POST /transcribe
       if (url.pathname === "/transcribe" && request.method === "POST") {
         const contentType = request.headers.get("Content-Type") || "";
-        let prediction: ReplicatePrediction;
 
         if (contentType.includes("multipart/form-data")) {
           const formData = await request.formData();
           const file = formData.get("file") as File | null;
           const language = (formData.get("language") as string) || null;
+          const provider = (formData.get("provider") as string) || "replicate";
+          const context = (formData.get("context") as string) || "";
 
           if (!file) {
             return jsonResponse(
@@ -444,16 +639,67 @@ export default {
           }
 
           const arrayBuffer = await file.arrayBuffer();
-          prediction = await createPrediction(
+
+          // Google Cloud provider
+          if (provider === "google") {
+            if (!env.GOOGLE_CLOUD_API_KEY) {
+              return jsonResponse(
+                { error: "Google Cloud provider is not configured. Contact admin." },
+                400,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+            if (file.size > 10 * 1024 * 1024) {
+              return jsonResponse(
+                { error: "Google Cloud provider only supports files <10MB (~1 min audio). Use Replicate for longer files." },
+                413,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+            const gResult = await transcribeWithGoogle(
+              arrayBuffer,
+              file.name,
+              language,
+              env.GOOGLE_CLOUD_API_KEY,
+              context,
+            );
+            return jsonResponse(gResult, 200, origin, env.ALLOWED_ORIGINS);
+          }
+
+          // Replicate provider (default)
+          const prediction = await createPrediction(
             arrayBuffer,
             file.name,
             language,
             env.REPLICATE_API_TOKEN,
+            context,
           );
+
+          const result = extractResult(prediction.output);
+          if (prediction.status === "succeeded" && result) {
+            return jsonResponse(result, 200, origin, env.ALLOWED_ORIGINS);
+          } else if (prediction.status === "failed") {
+            return jsonResponse(
+              { error: "Transcription failed" },
+              500,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          } else {
+            return jsonResponse(
+              { jobId: prediction.id, status: prediction.status },
+              202,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
         } else if (contentType.includes("application/json")) {
           const body = (await request.json()) as {
             url?: string;
             language?: string;
+            context?: string;
           };
           if (!body.url) {
             return jsonResponse(
@@ -463,34 +709,35 @@ export default {
               env.ALLOWED_ORIGINS,
             );
           }
-          prediction = await createPredictionFromUrl(
+          const prediction = await createPredictionFromUrl(
             body.url,
             body.language || null,
             env.REPLICATE_API_TOKEN,
+            body.context || "",
           );
+
+          const result = extractResult(prediction.output);
+          if (prediction.status === "succeeded" && result) {
+            return jsonResponse(result, 200, origin, env.ALLOWED_ORIGINS);
+          } else if (prediction.status === "failed") {
+            return jsonResponse(
+              { error: "Transcription failed" },
+              500,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          } else {
+            return jsonResponse(
+              { jobId: prediction.id, status: prediction.status },
+              202,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
         } else {
           return jsonResponse(
             { error: "Unsupported Content-Type" },
             400,
-            origin,
-            env.ALLOWED_ORIGINS,
-          );
-        }
-
-        const result = extractResult(prediction.output);
-        if (prediction.status === "succeeded" && result) {
-          return jsonResponse(result, 200, origin, env.ALLOWED_ORIGINS);
-        } else if (prediction.status === "failed") {
-          return jsonResponse(
-            { error: "Transcription failed" },
-            500,
-            origin,
-            env.ALLOWED_ORIGINS,
-          );
-        } else {
-          return jsonResponse(
-            { jobId: prediction.id, status: prediction.status },
-            202,
             origin,
             env.ALLOWED_ORIGINS,
           );

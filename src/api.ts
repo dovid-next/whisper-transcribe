@@ -29,6 +29,8 @@ export async function transcribeFile(
   file: File,
   language: string,
   password: string,
+  provider: string = "replicate",
+  context: string = "",
 ): Promise<TranscriptResult> {
   currentAbortController = new AbortController();
   const signal = currentAbortController.signal;
@@ -36,6 +38,8 @@ export async function transcribeFile(
   const formData = new FormData();
   formData.append("file", file);
   formData.append("language", language);
+  formData.append("provider", provider);
+  if (context.trim()) formData.append("context", context.trim());
 
   const response = await fetch(`${API_BASE}/transcribe`, {
     method: "POST",

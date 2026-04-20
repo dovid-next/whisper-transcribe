@@ -40,6 +40,7 @@ const resultsSection = document.getElementById("results-section")!;
 const resultsList = document.getElementById("results-list")!;
 const downloadAll = document.getElementById("download-all")!;
 const languageSelect = document.getElementById("language") as HTMLSelectElement;
+const contextTextarea = document.getElementById("context") as HTMLTextAreaElement;
 const passwordInput = document.getElementById("password") as HTMLInputElement;
 const unlockBtn = document.getElementById("unlock-btn")!;
 const passwordGate = document.getElementById("password-gate")!;
@@ -201,6 +202,11 @@ async function startTranscription() {
   resultsList.innerHTML = "";
 
   const language = languageSelect.value;
+  const context = contextTextarea.value;
+  const providerInput = document.querySelector<HTMLInputElement>(
+    'input[name="provider"]:checked',
+  );
+  const provider = providerInput?.value || "replicate";
   const total = state.files.length;
   let completed = 0;
 
@@ -226,7 +232,7 @@ async function startTranscription() {
     currentFileEl.textContent = entry.file.name;
 
     try {
-      entry.result = await transcribeFile(entry.file, language, state.password);
+      entry.result = await transcribeFile(entry.file, language, state.password, provider, context);
       entry.status = "done";
       completed++;
       addResultCard(entry, idx);

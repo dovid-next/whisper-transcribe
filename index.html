@@ -25,6 +25,30 @@
           </div>
         </div>
 
+        <!-- Provider -->
+        <div class="provider-row">
+          <label class="provider-option">
+            <input type="radio" name="provider" value="replicate" checked />
+            <span class="provider-label">
+              <span class="provider-name">Replicate (Whisper)</span>
+              <span class="provider-hint">Default. Best accuracy, supports long files.</span>
+            </span>
+          </label>
+          <label class="provider-option">
+            <input type="radio" name="provider" value="google" />
+            <span class="provider-label">
+              <span class="provider-name">Google Cloud</span>
+              <span class="provider-hint">Speaker diarization. Short files only (&lt;1 min).</span>
+            </span>
+          </label>
+        </div>
+
+        <!-- Context hint -->
+        <div class="context-row">
+          <label for="context">Context hints <span class="optional">(optional)</span></label>
+          <textarea id="context" rows="2" placeholder="Names, jargon, or context to help accuracy. E.g., 'Meeting with Josh Lapides, Shaya Retek, David Azerad about CTO hiring for healthcare RPM.'"></textarea>
+        </div>
+
         <!-- Settings -->
         <div class="settings-row">
           <div class="setting">
