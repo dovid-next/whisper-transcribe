@@ -483,123 +483,69 @@ async function deleteFromGCS(
   }
 }
 
-// --- Google Cloud Speech-to-Text v2 with Chirp 2 ---
-// v2 supports auto-detection of audio format (no encoding guesswork)
-// Chirp 2 is Google's flagship universal speech model
+// --- Gemini 2.5 Pro transcription via Vertex AI ---
+// Gemini handles audio transcription with natural speaker diarization
+// via prompt, and accepts context hints inline.
 
-const GCP_LOCATION = "us-central1"; // Chirp 2 supported region
-const V2_API_BASE = `https://${GCP_LOCATION}-speech.googleapis.com/v2`;
+const GCP_LOCATION = "us-central1";
+const GEMINI_MODEL = "gemini-2.5-pro";
 
-function v2LanguageCodes(language: string | null): string[] {
-  if (!language || language === "auto") {
-    // Chirp 2 supports "auto" language detection
-    return ["auto"];
-  }
-  const langMap: Record<string, string> = {
-    en: "en-US", he: "iw-IL", es: "es-US", fr: "fr-FR", de: "de-DE",
-    it: "it-IT", pt: "pt-BR", ru: "ru-RU", zh: "cmn-Hans-CN", ja: "ja-JP",
-    ko: "ko-KR", ar: "ar-XA", hi: "hi-IN", nl: "nl-NL", pl: "pl-PL",
-    tr: "tr-TR", uk: "uk-UA", vi: "vi-VN", th: "th-TH", id: "id-ID",
-    sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "nb-NO", el: "el-GR",
-    cs: "cs-CZ", ro: "ro-RO", hu: "hu-HU",
+function languageHint(language: string | null): string {
+  if (!language || language === "auto") return "";
+  const names: Record<string, string> = {
+    en: "English", he: "Hebrew", es: "Spanish", fr: "French", de: "German",
+    it: "Italian", pt: "Portuguese", ru: "Russian", zh: "Mandarin", ja: "Japanese",
+    ko: "Korean", ar: "Arabic", hi: "Hindi", nl: "Dutch", pl: "Polish",
+    tr: "Turkish", uk: "Ukrainian", vi: "Vietnamese", th: "Thai", id: "Indonesian",
+    sv: "Swedish", da: "Danish", fi: "Finnish", no: "Norwegian", el: "Greek",
+    cs: "Czech", ro: "Romanian", hu: "Hungarian", yi: "Yiddish",
   };
-  return [langMap[language] || language];
+  return names[language] || language;
 }
 
-function buildV2Config(
+function buildGeminiTranscriptionPrompt(
   language: string | null,
   context: string,
-): Record<string, unknown> {
-  const config: Record<string, unknown> = {
-    auto_decoding_config: {}, // Google auto-detects format from file header
-    model: "chirp_2",
-    language_codes: v2LanguageCodes(language),
-    features: {
-      enable_automatic_punctuation: true,
-    },
-  };
+): string {
+  let prompt = `You are a professional transcriptionist. Transcribe this audio verbatim.
+
+Rules:
+- Identify different speakers and label each turn (e.g., "Speaker 1:", "Speaker 2:").
+- If speaker names are clearly established in the audio or provided in the context below, use the actual names instead of generic Speaker labels.
+- Put each speaker turn on its own paragraph, separated by a blank line.
+- Preserve the natural speech: keep meaningful fillers ("you know", "like") but collapse repeated stutters.
+- Do NOT include timestamps.
+- Do NOT include any preamble, explanation, or summary — output ONLY the transcript.`;
+
+  const lang = languageHint(language);
+  if (lang) {
+    prompt += `\n\nThe audio is primarily in ${lang}.`;
+  }
 
   if (context.trim()) {
-    const phrases = context
-      .split(/[\n,]+/)
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0 && p.length < 100)
-      .slice(0, 500);
-    if (phrases.length > 0) {
-      config.adaptation = {
-        phrase_sets: [{
-          inline_phrase_set: {
-            phrases: phrases.map((p) => ({ value: p, boost: 15 })),
-          },
-        }],
-      };
-    }
+    prompt += `\n\nContext (names, organizations, jargon, or topics that may appear — use these spellings exactly when you recognize them):\n${context.trim()}`;
   }
 
-  return config;
+  return prompt;
 }
 
-// v2 inline sync recognize (for files <10MB)
-interface V2RecognizeResponse {
-  results?: Array<{
-    alternatives?: Array<{
-      transcript?: string;
-      words?: Array<{
-        word?: string;
-        speakerLabel?: string;
-        startOffset?: string;
-        endOffset?: string;
-      }>;
-    }>;
-    languageCode?: string;
+interface GeminiResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+    finishReason?: string;
   }>;
+  error?: { message?: string };
 }
 
-async function recognizeInlineV2(
+async function callGemini(
   token: string,
   projectId: string,
-  audioBytes: ArrayBuffer,
-  language: string | null,
-  context: string,
-): Promise<V2RecognizeResponse> {
-  const bytes = new Uint8Array(audioBytes);
-  let binary = "";
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  const base64 = btoa(binary);
-
-  const config = buildV2Config(language, context);
-  const url = `${V2_API_BASE}/projects/${projectId}/locations/${GCP_LOCATION}/recognizers/_:recognize`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ config, content: base64 }),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Google Speech v2 ${res.status}: ${err.slice(0, 1500)}`);
-  }
-
-  return res.json();
-}
-
-// v2 batch recognize (async, for GCS-hosted files)
-async function startV2BatchRecognize(
-  token: string,
-  projectId: string,
-  gcsUri: string,
-  language: string | null,
-  context: string,
+  audioPart: Record<string, unknown>,
+  prompt: string,
 ): Promise<string> {
-  const config = buildV2Config(language, context);
-  const url = `${V2_API_BASE}/projects/${projectId}/locations/${GCP_LOCATION}/recognizers/_:batchRecognize`;
+  const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${GCP_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -608,124 +554,78 @@ async function startV2BatchRecognize(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      config,
-      files: [{ uri: gcsUri }],
-      recognition_output_config: {
-        inline_response_config: {}, // Return results inline in the operation
+      contents: [
+        {
+          role: "user",
+          parts: [audioPart, { text: prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 65536,
       },
     }),
   });
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Google Speech v2 ${res.status}: ${err.slice(0, 1500)}`);
+    throw new Error(`Gemini ${res.status}: ${err.slice(0, 1500)}`);
   }
 
-  const data = (await res.json()) as { name: string };
-  return data.name;
+  const data = (await res.json()) as GeminiResponse;
+  if (data.error) {
+    throw new Error(`Gemini: ${data.error.message || "unknown error"}`);
+  }
+
+  const transcript = data.candidates?.[0]?.content?.parts
+    ?.map((p) => p.text || "")
+    .join("") || "";
+
+  if (!transcript) {
+    const finish = data.candidates?.[0]?.finishReason || "no output";
+    throw new Error(`Gemini produced no transcript (${finish})`);
+  }
+
+  return transcript.trim();
 }
 
-interface V2Operation {
-  name: string;
-  done?: boolean;
-  error?: { code?: number; message?: string };
-  response?: {
-    "@type"?: string;
-    results?: Record<string, {
-      transcript?: V2RecognizeResponse;
-      error?: { message?: string };
-    }>;
-  };
-}
-
-async function checkV2Operation(
+async function transcribeWithGeminiInline(
   token: string,
-  operationName: string,
-): Promise<V2Operation> {
-  const url = `${V2_API_BASE}/${operationName}`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return res.json();
-}
-
-function v2ResultsToTranscript(response: V2RecognizeResponse | undefined): {
-  transcript: string;
-  language: string;
-  segments: Array<{ start: number; end: number; text: string }>;
-} {
-  const results = response?.results || [];
-
-  // Build word list with speaker labels
-  const allWords: Array<{
-    word: string;
-    speaker: string;
-    start: number;
-    end: number;
-  }> = [];
-
-  for (const result of results) {
-    const alt = result.alternatives?.[0];
-    if (alt?.words) {
-      for (const w of alt.words) {
-        allWords.push({
-          word: w.word || "",
-          speaker: w.speakerLabel || "",
-          start: parseFloat((w.startOffset || "0s").replace("s", "")),
-          end: parseFloat((w.endOffset || "0s").replace("s", "")),
-        });
-      }
-    }
+  projectId: string,
+  audio: ArrayBuffer,
+  mimeType: string,
+  language: string | null,
+  context: string,
+): Promise<string> {
+  const bytes = new Uint8Array(audio);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
   }
+  const base64 = btoa(binary);
 
-  // Group consecutive words by speaker
-  const segs: Array<{ start: number; end: number; text: string; speaker: string }> = [];
-  let cur: { start: number; end: number; text: string; speaker: string } | null = null;
-  for (const w of allWords) {
-    if (!cur || cur.speaker !== w.speaker) {
-      if (cur) segs.push(cur);
-      cur = { start: w.start, end: w.end, text: w.word, speaker: w.speaker };
-    } else {
-      cur.text += " " + w.word;
-      cur.end = w.end;
-    }
-  }
-  if (cur) segs.push(cur);
-
-  // Build transcript with speaker labels
-  const transcript = segs.length > 0
-    ? segs.map((s) => (s.speaker ? `${s.speaker}: ${s.text}` : s.text)).join("\n\n")
-    : results.map((r) => r.alternatives?.[0]?.transcript || "").filter(Boolean).join(" ");
-
-  const languageCode = results[0]?.languageCode || "unknown";
-
-  return {
-    transcript,
-    language: languageCode,
-    segments: segs.map((s) => ({ start: s.start, end: s.end, text: s.text })),
+  const audioPart = {
+    inline_data: { mime_type: mimeType, data: base64 },
   };
+  const prompt = buildGeminiTranscriptionPrompt(language, context);
+  return callGemini(token, projectId, audioPart, prompt);
 }
 
-// Encode a Google job into a single opaque jobId so the client can poll.
-// Contains operation name + GCS object so we can clean up after polling.
-function encodeGoogleJobId(operationName: string, gcsObject: string): string {
-  const payload = JSON.stringify({ op: operationName, obj: gcsObject });
-  return "gcp_" + base64UrlEncode(payload);
+async function transcribeWithGeminiGcs(
+  token: string,
+  projectId: string,
+  gcsUri: string,
+  mimeType: string,
+  language: string | null,
+  context: string,
+): Promise<string> {
+  const audioPart = {
+    file_data: { mime_type: mimeType, file_uri: gcsUri },
+  };
+  const prompt = buildGeminiTranscriptionPrompt(language, context);
+  return callGemini(token, projectId, audioPart, prompt);
 }
-
-function decodeGoogleJobId(jobId: string): { op: string; obj: string } | null {
-  if (!jobId.startsWith("gcp_")) return null;
-  try {
-    const b64 = jobId.slice(4).replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
-    const json = atob(padded);
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-}
-
-// (Legacy v1 inline path removed — now uses v2 + chirp_2 via service account.)
 
 function extractResult(output: ReplicatePrediction["output"]): {
   transcript: string;
@@ -860,11 +760,11 @@ export default {
 
           const arrayBuffer = await file.arrayBuffer();
 
-          // Google Cloud provider (v2 + chirp_2, service account auth)
+          // Google provider — uses Gemini 2.5 Pro via Vertex AI
           if (provider === "google") {
             if (!env.GOOGLE_SERVICE_ACCOUNT) {
               return jsonResponse(
-                { error: "Google Cloud provider is not configured. Contact admin." },
+                { error: "Google (Gemini) provider is not configured. Contact admin." },
                 400,
                 origin,
                 env.ALLOWED_ORIGINS,
@@ -873,38 +773,7 @@ export default {
             const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
             const token = await getAccessToken(sa);
 
-            // Path A: small files — inline sync recognize
-            if (file.size <= 10 * 1024 * 1024) {
-              const resp = await recognizeInlineV2(
-                token,
-                sa.project_id,
-                arrayBuffer,
-                language,
-                context,
-              );
-              return jsonResponse(
-                v2ResultsToTranscript(resp),
-                200,
-                origin,
-                env.ALLOWED_ORIGINS,
-              );
-            }
-
-            // Path B: larger files — upload to GCS, batchRecognize, poll
-            if (!env.GOOGLE_GCS_BUCKET) {
-              return jsonResponse(
-                { error: "Google Cloud large-file path is not configured. Contact admin." },
-                400,
-                origin,
-                env.ALLOWED_ORIGINS,
-              );
-            }
-
-            // Random object name so uploads don't collide
             const ext = file.name.split(".").pop()?.toLowerCase() || "bin";
-            const uuid = crypto.randomUUID();
-            const objectName = `uploads/${uuid}.${ext}`;
-
             const mimeMap: Record<string, string> = {
               mp3: "audio/mpeg",
               wav: "audio/wav",
@@ -914,9 +783,40 @@ export default {
               ogg: "audio/ogg",
               flac: "audio/flac",
               aac: "audio/aac",
-              opus: "audio/opus",
+              opus: "audio/ogg",
             };
             const contentTypeHeader = mimeMap[ext] || "application/octet-stream";
+
+            // Small files (<20MB): send inline
+            if (file.size <= 19 * 1024 * 1024) {
+              const transcript = await transcribeWithGeminiInline(
+                token,
+                sa.project_id,
+                arrayBuffer,
+                contentTypeHeader,
+                language,
+                context,
+              );
+              return jsonResponse(
+                { transcript, language: languageHint(language) || "auto", segments: [] },
+                200,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+
+            // Larger files: upload to GCS, call Gemini with file_uri, then delete GCS object
+            if (!env.GOOGLE_GCS_BUCKET) {
+              return jsonResponse(
+                { error: "GCS bucket is not configured for large-file Gemini path. Contact admin." },
+                400,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+
+            const uuid = crypto.randomUUID();
+            const objectName = `uploads/${uuid}.${ext}`;
 
             const gcsUri = await uploadToGCS(
               token,
@@ -927,24 +827,23 @@ export default {
             );
 
             try {
-              const operationName = await startV2BatchRecognize(
+              const transcript = await transcribeWithGeminiGcs(
                 token,
                 sa.project_id,
                 gcsUri,
+                contentTypeHeader,
                 language,
                 context,
               );
-              const jobId = encodeGoogleJobId(operationName, objectName);
               return jsonResponse(
-                { jobId, status: "starting" },
-                202,
+                { transcript, language: languageHint(language) || "auto", segments: [] },
+                200,
                 origin,
                 env.ALLOWED_ORIGINS,
               );
-            } catch (err) {
-              // Clean up GCS on failure to start
+            } finally {
+              // Always clean up GCS — never retain audio
               await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, objectName);
-              throw err;
             }
           }
 
@@ -1036,63 +935,7 @@ export default {
           );
         }
 
-        // Google Cloud long-running operation
-        if (jobId.startsWith("gcp_")) {
-          const decoded = decodeGoogleJobId(jobId);
-          if (!decoded || !env.GOOGLE_SERVICE_ACCOUNT || !env.GOOGLE_GCS_BUCKET) {
-            return jsonResponse(
-              { error: "Invalid Google job ID or provider not configured" },
-              400,
-              origin,
-              env.ALLOWED_ORIGINS,
-            );
-          }
-
-          const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
-          const token = await getAccessToken(sa);
-          const op = await checkV2Operation(token, decoded.op);
-
-          if (op.done) {
-            // Clean up GCS (best effort — always try to delete)
-            await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, decoded.obj);
-
-            if (op.error) {
-              return jsonResponse(
-                { status: "failed", error: op.error.message || "Transcription failed" },
-                200,
-                origin,
-                env.ALLOWED_ORIGINS,
-              );
-            }
-            // v2 batchRecognize returns results keyed by GCS URI
-            const results = op.response?.results || {};
-            const firstKey = Object.keys(results)[0];
-            const fileResult = firstKey ? results[firstKey] : undefined;
-            if (fileResult?.error) {
-              return jsonResponse(
-                { status: "failed", error: fileResult.error.message || "Transcription failed" },
-                200,
-                origin,
-                env.ALLOWED_ORIGINS,
-              );
-            }
-            const gResult = v2ResultsToTranscript(fileResult?.transcript);
-            return jsonResponse(
-              { status: "succeeded", ...gResult },
-              200,
-              origin,
-              env.ALLOWED_ORIGINS,
-            );
-          }
-
-          return jsonResponse(
-            { status: "processing" },
-            200,
-            origin,
-            env.ALLOWED_ORIGINS,
-          );
-        }
-
+        // Gemini is synchronous — no more Google operation polling.
         // Replicate prediction
         if (!isValidJobId(jobId)) {
           return jsonResponse(
