@@ -483,55 +483,39 @@ async function deleteFromGCS(
   }
 }
 
-// --- Google Cloud Speech long-running recognize ---
+// --- Google Cloud Speech-to-Text v2 with Chirp 2 ---
+// v2 supports auto-detection of audio format (no encoding guesswork)
+// Chirp 2 is Google's flagship universal speech model
 
-interface GoogleOperation {
-  name: string;
-  done?: boolean;
-  error?: { code?: number; message?: string };
-  response?: {
-    results?: GoogleSpeechResponse["results"];
+const GCP_LOCATION = "us-central1"; // Chirp 2 supported region
+const V2_API_BASE = `https://${GCP_LOCATION}-speech.googleapis.com/v2`;
+
+function v2LanguageCodes(language: string | null): string[] {
+  if (!language || language === "auto") {
+    // Chirp 2 supports "auto" language detection
+    return ["auto"];
+  }
+  const langMap: Record<string, string> = {
+    en: "en-US", he: "iw-IL", es: "es-US", fr: "fr-FR", de: "de-DE",
+    it: "it-IT", pt: "pt-BR", ru: "ru-RU", zh: "cmn-Hans-CN", ja: "ja-JP",
+    ko: "ko-KR", ar: "ar-XA", hi: "hi-IN", nl: "nl-NL", pl: "pl-PL",
+    tr: "tr-TR", uk: "uk-UA", vi: "vi-VN", th: "th-TH", id: "id-ID",
+    sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "nb-NO", el: "el-GR",
+    cs: "cs-CZ", ro: "ro-RO", hu: "hu-HU",
   };
+  return [langMap[language] || language];
 }
 
-function buildGoogleSpeechConfig(
-  fileName: string,
+function buildV2Config(
   language: string | null,
   context: string,
 ): Record<string, unknown> {
-  const ext = fileName.split(".").pop()?.toLowerCase() || "mp3";
-  const encodingMap: Record<string, string> = {
-    mp3: "MP3",
-    wav: "LINEAR16",
-    flac: "FLAC",
-    opus: "OGG_OPUS",
-    ogg: "OGG_OPUS",
-    webm: "WEBM_OPUS",
-  };
-  const encoding = encodingMap[ext] || "ENCODING_UNSPECIFIED";
-
-  const langMap: Record<string, string> = {
-    en: "en-US", he: "iw-IL", es: "es-ES", fr: "fr-FR", de: "de-DE",
-    it: "it-IT", pt: "pt-BR", ru: "ru-RU", zh: "zh-CN", ja: "ja-JP",
-    ko: "ko-KR", ar: "ar-SA", hi: "hi-IN", nl: "nl-NL", pl: "pl-PL",
-    tr: "tr-TR", uk: "uk-UA", vi: "vi-VN", th: "th-TH", id: "id-ID",
-    sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "no-NO", el: "el-GR",
-    cs: "cs-CZ", ro: "ro-RO", hu: "hu-HU",
-  };
-  const languageCode = language && language !== "auto"
-    ? (langMap[language] || language)
-    : "en-US";
-
   const config: Record<string, unknown> = {
-    encoding,
-    languageCode,
-    enableAutomaticPunctuation: true,
-    enableWordTimeOffsets: true,
-    model: "latest_long",
-    diarizationConfig: {
-      enableSpeakerDiarization: true,
-      minSpeakerCount: 2,
-      maxSpeakerCount: 6,
+    auto_decoding_config: {}, // Google auto-detects format from file header
+    model: "chirp_2",
+    language_codes: v2LanguageCodes(language),
+    features: {
+      enable_automatic_punctuation: true,
     },
   };
 
@@ -542,79 +526,161 @@ function buildGoogleSpeechConfig(
       .filter((p) => p.length > 0 && p.length < 100)
       .slice(0, 500);
     if (phrases.length > 0) {
-      config.speechContexts = [{ phrases, boost: 15 }];
+      config.adaptation = {
+        phrase_sets: [{
+          inline_phrase_set: {
+            phrases: phrases.map((p) => ({ value: p, boost: 15 })),
+          },
+        }],
+      };
     }
   }
 
   return config;
 }
 
-async function startGoogleLongRunning(
+// v2 inline sync recognize (for files <10MB)
+interface V2RecognizeResponse {
+  results?: Array<{
+    alternatives?: Array<{
+      transcript?: string;
+      words?: Array<{
+        word?: string;
+        speakerLabel?: string;
+        startOffset?: string;
+        endOffset?: string;
+      }>;
+    }>;
+    languageCode?: string;
+  }>;
+}
+
+async function recognizeInlineV2(
   token: string,
-  gcsUri: string,
-  config: Record<string, unknown>,
-): Promise<string> {
-  const res = await fetch(
-    "https://speech.googleapis.com/v1/speech:longrunningrecognize",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        config,
-        audio: { uri: gcsUri },
-      }),
+  projectId: string,
+  audioBytes: ArrayBuffer,
+  language: string | null,
+  context: string,
+): Promise<V2RecognizeResponse> {
+  const bytes = new Uint8Array(audioBytes);
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  const base64 = btoa(binary);
+
+  const config = buildV2Config(language, context);
+  const url = `${V2_API_BASE}/projects/${projectId}/locations/${GCP_LOCATION}/recognizers/_:recognize`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
     },
-  );
+    body: JSON.stringify({ config, content: base64 }),
+  });
+
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Google Speech ${res.status}: ${err.slice(0, 200)}`);
+    throw new Error(`Google Speech v2 ${res.status}: ${err.slice(0, 1500)}`);
   }
+
+  return res.json();
+}
+
+// v2 batch recognize (async, for GCS-hosted files)
+async function startV2BatchRecognize(
+  token: string,
+  projectId: string,
+  gcsUri: string,
+  language: string | null,
+  context: string,
+): Promise<string> {
+  const config = buildV2Config(language, context);
+  const url = `${V2_API_BASE}/projects/${projectId}/locations/${GCP_LOCATION}/recognizers/_:batchRecognize`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      config,
+      files: [{ uri: gcsUri }],
+      recognition_output_config: {
+        inline_response_config: {}, // Return results inline in the operation
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Google Speech v2 ${res.status}: ${err.slice(0, 1500)}`);
+  }
+
   const data = (await res.json()) as { name: string };
   return data.name;
 }
 
-async function checkGoogleOperation(
+interface V2Operation {
+  name: string;
+  done?: boolean;
+  error?: { code?: number; message?: string };
+  response?: {
+    "@type"?: string;
+    results?: Record<string, {
+      transcript?: V2RecognizeResponse;
+      error?: { message?: string };
+    }>;
+  };
+}
+
+async function checkV2Operation(
   token: string,
   operationName: string,
-): Promise<GoogleOperation> {
-  const res = await fetch(
-    `https://speech.googleapis.com/v1/operations/${operationName}`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
+): Promise<V2Operation> {
+  const url = `${V2_API_BASE}/${operationName}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   return res.json();
 }
 
-function googleResultsToTranscript(results: GoogleSpeechResponse["results"]): {
+function v2ResultsToTranscript(response: V2RecognizeResponse | undefined): {
   transcript: string;
   language: string;
   segments: Array<{ start: number; end: number; text: string }>;
 } {
+  const results = response?.results || [];
+
+  // Build word list with speaker labels
   const allWords: Array<{
     word: string;
-    speaker: number;
+    speaker: string;
     start: number;
     end: number;
   }> = [];
 
-  for (const result of results || []) {
+  for (const result of results) {
     const alt = result.alternatives?.[0];
     if (alt?.words) {
       for (const w of alt.words) {
         allWords.push({
-          word: w.word,
-          speaker: w.speakerTag || 0,
-          start: parseFloat((w.startTime || "0s").replace("s", "")),
-          end: parseFloat((w.endTime || "0s").replace("s", "")),
+          word: w.word || "",
+          speaker: w.speakerLabel || "",
+          start: parseFloat((w.startOffset || "0s").replace("s", "")),
+          end: parseFloat((w.endOffset || "0s").replace("s", "")),
         });
       }
     }
   }
 
-  const segs: Array<{ start: number; end: number; text: string; speaker: number }> = [];
-  let cur: { start: number; end: number; text: string; speaker: number } | null = null;
+  // Group consecutive words by speaker
+  const segs: Array<{ start: number; end: number; text: string; speaker: string }> = [];
+  let cur: { start: number; end: number; text: string; speaker: string } | null = null;
   for (const w of allWords) {
     if (!cur || cur.speaker !== w.speaker) {
       if (cur) segs.push(cur);
@@ -626,19 +692,15 @@ function googleResultsToTranscript(results: GoogleSpeechResponse["results"]): {
   }
   if (cur) segs.push(cur);
 
-  const transcript = segs
-    .map((s) => (s.speaker > 0 ? `Speaker ${s.speaker}: ${s.text}` : s.text))
-    .join("\n\n");
+  // Build transcript with speaker labels
+  const transcript = segs.length > 0
+    ? segs.map((s) => (s.speaker ? `${s.speaker}: ${s.text}` : s.text)).join("\n\n")
+    : results.map((r) => r.alternatives?.[0]?.transcript || "").filter(Boolean).join(" ");
 
-  const fallback = (results || [])
-    .map((r) => r.alternatives?.[0]?.transcript || "")
-    .filter(Boolean)
-    .join(" ");
-
-  const languageCode = (results && results[0]?.languageCode) || "unknown";
+  const languageCode = results[0]?.languageCode || "unknown";
 
   return {
-    transcript: transcript || fallback,
+    transcript,
     language: languageCode,
     segments: segs.map((s) => ({ start: s.start, end: s.end, text: s.text })),
   };
@@ -663,158 +725,7 @@ function decodeGoogleJobId(jobId: string): { op: string; obj: string } | null {
   }
 }
 
-// --- Google Cloud Speech-to-Text (sync inline, <10MB files only) ---
-
-interface GoogleSpeechResponse {
-  results?: Array<{
-    alternatives?: Array<{
-      transcript?: string;
-      words?: Array<{
-        word: string;
-        speakerTag?: number;
-        startTime?: string;
-        endTime?: string;
-      }>;
-    }>;
-    languageCode?: string;
-  }>;
-  error?: { message?: string };
-}
-
-async function transcribeWithGoogle(
-  fileData: ArrayBuffer,
-  fileName: string,
-  language: string | null,
-  apiKey: string,
-  context: string = "",
-): Promise<{ transcript: string; language: string; segments: Array<{ start: number; end: number; text: string }> }> {
-  const bytes = new Uint8Array(fileData);
-  let binary = "";
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  const base64 = btoa(binary);
-
-  const ext = fileName.split(".").pop()?.toLowerCase() || "mp3";
-  const encodingMap: Record<string, string> = {
-    mp3: "MP3",
-    wav: "LINEAR16",
-    flac: "FLAC",
-    opus: "OGG_OPUS",
-    ogg: "OGG_OPUS",
-    webm: "WEBM_OPUS",
-  };
-  const encoding = encodingMap[ext] || "ENCODING_UNSPECIFIED";
-
-  // Google expects BCP-47 (e.g., "en-US"). Map some common codes.
-  const langMap: Record<string, string> = {
-    en: "en-US", he: "iw-IL", es: "es-ES", fr: "fr-FR", de: "de-DE",
-    it: "it-IT", pt: "pt-BR", ru: "ru-RU", zh: "zh-CN", ja: "ja-JP",
-    ko: "ko-KR", ar: "ar-SA", hi: "hi-IN", nl: "nl-NL", pl: "pl-PL",
-    tr: "tr-TR", uk: "uk-UA", vi: "vi-VN", th: "th-TH", id: "id-ID",
-    sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "no-NO", el: "el-GR",
-    cs: "cs-CZ", ro: "ro-RO", hu: "hu-HU",
-  };
-  const languageCode = language && language !== "auto" ? (langMap[language] || language) : "en-US";
-
-  const config: Record<string, unknown> = {
-    encoding,
-    languageCode,
-    enableAutomaticPunctuation: true,
-    enableWordTimeOffsets: true,
-    model: "latest_long",
-    diarizationConfig: {
-      enableSpeakerDiarization: true,
-      minSpeakerCount: 2,
-      maxSpeakerCount: 6,
-    },
-  };
-
-  // Phrases bias for context
-  if (context.trim()) {
-    // Split context into phrases by newlines or commas
-    const phrases = context
-      .split(/[\n,]+/)
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0 && p.length < 100)
-      .slice(0, 500);
-    if (phrases.length > 0) {
-      config.speechContexts = [{ phrases, boost: 15 }];
-    }
-  }
-
-  const response = await fetch(
-    `https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        config,
-        audio: { content: base64 },
-      }),
-    },
-  );
-
-  if (!response.ok) {
-    const errBody = await response.text();
-    throw new Error(`Google Cloud ${response.status}: ${errBody.slice(0, 300)}`);
-  }
-
-  const data = (await response.json()) as GoogleSpeechResponse;
-  if (data.error) {
-    throw new Error(`Google Cloud: ${data.error.message || "unknown error"}`);
-  }
-
-  // Build transcript with speaker labels from words
-  const results = data.results || [];
-  const allWords: Array<{ word: string; speaker: number; start: number; end: number }> = [];
-  for (const result of results) {
-    const alt = result.alternatives?.[0];
-    if (alt?.words) {
-      for (const w of alt.words) {
-        allWords.push({
-          word: w.word,
-          speaker: w.speakerTag || 0,
-          start: parseFloat((w.startTime || "0s").replace("s", "")),
-          end: parseFloat((w.endTime || "0s").replace("s", "")),
-        });
-      }
-    }
-  }
-
-  // Group into segments by speaker
-  const segments: Array<{ start: number; end: number; text: string; speaker: number }> = [];
-  let current: { start: number; end: number; text: string; speaker: number } | null = null;
-  for (const w of allWords) {
-    if (!current || current.speaker !== w.speaker) {
-      if (current) segments.push(current);
-      current = { start: w.start, end: w.end, text: w.word, speaker: w.speaker };
-    } else {
-      current.text += " " + w.word;
-      current.end = w.end;
-    }
-  }
-  if (current) segments.push(current);
-
-  // Build final transcript with speaker labels
-  const transcript = segments
-    .map((s) => (s.speaker > 0 ? `Speaker ${s.speaker}: ${s.text}` : s.text))
-    .join("\n\n");
-
-  // Fallback: if no diarization, use simple concat
-  const fallbackTranscript =
-    results
-      .map((r) => r.alternatives?.[0]?.transcript || "")
-      .filter((s) => s)
-      .join(" ");
-
-  return {
-    transcript: transcript || fallbackTranscript,
-    language: results[0]?.languageCode || languageCode,
-    segments: segments.map((s) => ({ start: s.start, end: s.end, text: s.text })),
-  };
-}
+// (Legacy v1 inline path removed — now uses v2 + chirp_2 via service account.)
 
 function extractResult(output: ReplicatePrediction["output"]): {
   transcript: string;
@@ -949,22 +860,38 @@ export default {
 
           const arrayBuffer = await file.arrayBuffer();
 
-          // Google Cloud provider
+          // Google Cloud provider (v2 + chirp_2, service account auth)
           if (provider === "google") {
-            // Path A: small files (<10MB) — inline sync recognize via API key
-            if (file.size <= 10 * 1024 * 1024 && env.GOOGLE_CLOUD_API_KEY) {
-              const gResult = await transcribeWithGoogle(
+            if (!env.GOOGLE_SERVICE_ACCOUNT) {
+              return jsonResponse(
+                { error: "Google Cloud provider is not configured. Contact admin." },
+                400,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+            const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
+            const token = await getAccessToken(sa);
+
+            // Path A: small files — inline sync recognize
+            if (file.size <= 10 * 1024 * 1024) {
+              const resp = await recognizeInlineV2(
+                token,
+                sa.project_id,
                 arrayBuffer,
-                file.name,
                 language,
-                env.GOOGLE_CLOUD_API_KEY,
                 context,
               );
-              return jsonResponse(gResult, 200, origin, env.ALLOWED_ORIGINS);
+              return jsonResponse(
+                v2ResultsToTranscript(resp),
+                200,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
             }
 
-            // Path B: larger files — upload to GCS, start long-running recognize
-            if (!env.GOOGLE_SERVICE_ACCOUNT || !env.GOOGLE_GCS_BUCKET) {
+            // Path B: larger files — upload to GCS, batchRecognize, poll
+            if (!env.GOOGLE_GCS_BUCKET) {
               return jsonResponse(
                 { error: "Google Cloud large-file path is not configured. Contact admin." },
                 400,
@@ -972,9 +899,6 @@ export default {
                 env.ALLOWED_ORIGINS,
               );
             }
-
-            const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
-            const token = await getAccessToken(sa);
 
             // Random object name so uploads don't collide
             const ext = file.name.split(".").pop()?.toLowerCase() || "bin";
@@ -1002,12 +926,13 @@ export default {
               contentTypeHeader,
             );
 
-            const config = buildGoogleSpeechConfig(file.name, language, context);
             try {
-              const operationName = await startGoogleLongRunning(
+              const operationName = await startV2BatchRecognize(
                 token,
+                sa.project_id,
                 gcsUri,
-                config,
+                language,
+                context,
               );
               const jobId = encodeGoogleJobId(operationName, objectName);
               return jsonResponse(
@@ -1125,7 +1050,7 @@ export default {
 
           const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
           const token = await getAccessToken(sa);
-          const op = await checkGoogleOperation(token, decoded.op);
+          const op = await checkV2Operation(token, decoded.op);
 
           if (op.done) {
             // Clean up GCS (best effort — always try to delete)
@@ -1139,7 +1064,19 @@ export default {
                 env.ALLOWED_ORIGINS,
               );
             }
-            const gResult = googleResultsToTranscript(op.response?.results);
+            // v2 batchRecognize returns results keyed by GCS URI
+            const results = op.response?.results || {};
+            const firstKey = Object.keys(results)[0];
+            const fileResult = firstKey ? results[firstKey] : undefined;
+            if (fileResult?.error) {
+              return jsonResponse(
+                { status: "failed", error: fileResult.error.message || "Transcription failed" },
+                200,
+                origin,
+                env.ALLOWED_ORIGINS,
+              );
+            }
+            const gResult = v2ResultsToTranscript(fileResult?.transcript);
             return jsonResponse(
               { status: "succeeded", ...gResult },
               200,
@@ -1204,9 +1141,10 @@ export default {
         origin,
         env.ALLOWED_ORIGINS,
       );
-    } catch (_err) {
+    } catch (err) {
+      const debug = err instanceof Error ? err.message : String(err);
       return jsonResponse(
-        { error: "Internal server error" },
+        { error: "Internal server error", debug },
         500,
         origin,
         env.ALLOWED_ORIGINS,
