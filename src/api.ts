@@ -12,7 +12,18 @@ interface TranscribeResponse {
   segments?: Array<{ start: number; end: number; text: string }>;
   jobId?: string;
   status?: string;
+  state?: string;
   error?: string;
+}
+
+// Optional callback so the UI can show batch state (PENDING / QUEUED / RUNNING)
+export type ProgressCallback = (info: {
+  state?: string;
+  elapsedSec: number;
+}) => void;
+let currentProgressCallback: ProgressCallback | null = null;
+export function setProgressCallback(cb: ProgressCallback | null) {
+  currentProgressCallback = cb;
 }
 
 // Current AbortController — allows cancelling in-flight requests
@@ -83,9 +94,20 @@ export async function transcribeFile(
 }
 
 async function pollForResult(jobId: string, password: string, signal: AbortSignal): Promise<TranscriptResult> {
-  const maxAttempts = 120;
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((r) => setTimeout(r, 5000));
+  // Poll for up to 60 minutes. Gemini Batch Prediction can take 10-30 min
+  // for long audio files (provisioning + queuing + running).
+  const isBatchJob = jobId.startsWith("gcb_");
+  // Faster polling early on (every 5s), then slow down for batch jobs (every 15s after 1 min)
+  const fastInterval = 5000;
+  const slowInterval = 15000;
+  const fastDuration = 60_000; // first minute = fast polling
+  const maxDuration = 60 * 60 * 1000; // 60 minutes total
+
+  const start = Date.now();
+  while (Date.now() - start < maxDuration) {
+    const elapsed = Date.now() - start;
+    const interval = isBatchJob && elapsed > fastDuration ? slowInterval : fastInterval;
+    await new Promise((r) => setTimeout(r, interval));
 
     if (signal.aborted) throw new Error("Cancelled");
 
@@ -94,6 +116,13 @@ async function pollForResult(jobId: string, password: string, signal: AbortSigna
       signal,
     });
     const data: TranscribeResponse = await response.json();
+
+    if (currentProgressCallback) {
+      currentProgressCallback({
+        state: data.state,
+        elapsedSec: Math.floor((Date.now() - start) / 1000),
+      });
+    }
 
     if (data.status === "succeeded" && data.transcript) {
       return {

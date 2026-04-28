@@ -1,5 +1,5 @@
 import "./style.css";
-import { transcribeFile, cancelTranscription } from "./api.ts";
+import { transcribeFile, cancelTranscription, setProgressCallback } from "./api.ts";
 import type { TranscriptResult } from "./api.ts";
 
 interface FileEntry {
@@ -231,6 +231,18 @@ async function startTranscription() {
     progressBar.style.width = `${(completed / total) * 100}%`;
     currentFileEl.textContent = entry.file.name;
 
+    // Show batch-job state (PENDING / QUEUED / RUNNING) when we get progress updates
+    setProgressCallback(({ state: jobState, elapsedSec }) => {
+      const stateLabel = (jobState || "")
+        .replace("JOB_STATE_", "")
+        .toLowerCase();
+      const mins = Math.floor(elapsedSec / 60);
+      const secs = elapsedSec % 60;
+      const elapsed = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      const stateText = stateLabel ? ` (${stateLabel})` : "";
+      currentFileEl.textContent = `${entry.file.name} — ${elapsed}${stateText}`;
+    });
+
     try {
       entry.result = await transcribeFile(entry.file, language, state.password, provider, context);
       entry.status = "done";
@@ -259,11 +271,14 @@ async function startTranscription() {
       }
     }
 
+    setProgressCallback(null);
+
     renderFileList();
     progressCount.textContent = `${completed}/${total}`;
     progressBar.style.width = `${(completed / total) * 100}%`;
   }
 
+  setProgressCallback(null);
   progressText.textContent = state.cancelled ? "Cancelled" : "Complete!";
   currentFileEl.textContent = "";
   state.isProcessing = false;

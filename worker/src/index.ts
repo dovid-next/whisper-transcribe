@@ -627,6 +627,171 @@ async function transcribeWithGeminiGcs(
   return callGemini(token, projectId, audioPart, prompt);
 }
 
+// --- Gemini Batch Prediction (async, for long files) ---
+// Submits a batch job that runs entirely on Google's infrastructure.
+// Returns immediately with a job name; client polls /status to check.
+
+interface BatchJobResponse {
+  name?: string;
+  state?:
+    | "JOB_STATE_QUEUED"
+    | "JOB_STATE_PENDING"
+    | "JOB_STATE_RUNNING"
+    | "JOB_STATE_SUCCEEDED"
+    | "JOB_STATE_FAILED"
+    | "JOB_STATE_CANCELLING"
+    | "JOB_STATE_CANCELLED"
+    | "JOB_STATE_PAUSED"
+    | "JOB_STATE_EXPIRED"
+    | "JOB_STATE_UPDATING"
+    | "JOB_STATE_PARTIALLY_SUCCEEDED";
+  error?: { code?: number; message?: string };
+  outputInfo?: {
+    gcsOutputDirectory?: string;
+  };
+}
+
+async function submitGeminiBatch(
+  token: string,
+  projectId: string,
+  inputJsonlGcsUri: string,
+  outputGcsPrefix: string,
+): Promise<string> {
+  const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${GCP_LOCATION}/batchPredictionJobs`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      displayName: `transcript-${Date.now()}`,
+      model: `publishers/google/models/${GEMINI_MODEL}`,
+      inputConfig: {
+        instancesFormat: "jsonl",
+        gcsSource: { uris: [inputJsonlGcsUri] },
+      },
+      outputConfig: {
+        predictionsFormat: "jsonl",
+        gcsDestination: { outputUriPrefix: outputGcsPrefix },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini batch submit ${res.status}: ${err.slice(0, 1500)}`);
+  }
+
+  const data = (await res.json()) as BatchJobResponse;
+  if (!data.name) {
+    throw new Error("Gemini batch: no job name returned");
+  }
+  return data.name;
+}
+
+async function checkGeminiBatch(
+  token: string,
+  jobName: string,
+): Promise<BatchJobResponse> {
+  const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1/${jobName}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.json();
+}
+
+async function listGcsObjects(
+  token: string,
+  bucket: string,
+  prefix: string,
+): Promise<string[]> {
+  const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o?prefix=${encodeURIComponent(prefix)}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return [];
+  const data = (await res.json()) as { items?: Array<{ name: string }> };
+  return (data.items || []).map((i) => i.name);
+}
+
+async function readGcsObject(
+  token: string,
+  bucket: string,
+  objectName: string,
+): Promise<string> {
+  const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(objectName)}?alt=media`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    throw new Error(`GCS read ${res.status}`);
+  }
+  return res.text();
+}
+
+function parseBatchOutputJsonl(jsonl: string): string {
+  // Each line is a JSON object with a `response` (or `predictions`) field
+  // containing the Gemini response.
+  let transcript = "";
+  for (const line of jsonl.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as {
+        response?: GeminiResponse;
+        // Some batch outputs use 'predictions' or 'status' fields
+        status?: string;
+      };
+      const resp = obj.response;
+      if (resp?.candidates) {
+        for (const cand of resp.candidates) {
+          for (const part of cand.content?.parts || []) {
+            if (part.text) transcript += part.text;
+          }
+        }
+      }
+    } catch {
+      // Skip unparseable lines
+    }
+  }
+  return transcript.trim();
+}
+
+// Encode a Gemini batch job into an opaque jobId for client polling.
+// Includes job name + GCS object names for cleanup.
+function encodeBatchJobId(
+  jobName: string,
+  audioObj: string,
+  jsonlObj: string,
+  outputPrefix: string,
+): string {
+  const payload = JSON.stringify({
+    j: jobName,
+    a: audioObj,
+    i: jsonlObj,
+    o: outputPrefix,
+  });
+  return "gcb_" + base64UrlEncode(payload);
+}
+
+function decodeBatchJobId(jobId: string): {
+  j: string;
+  a: string;
+  i: string;
+  o: string;
+} | null {
+  if (!jobId.startsWith("gcb_")) return null;
+  try {
+    const b64 = jobId.slice(4).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
+}
+
 function extractResult(output: ReplicatePrediction["output"]): {
   transcript: string;
   language: string;
@@ -722,6 +887,7 @@ export default {
       return handleAdminUnlock(request, env, origin);
     }
 
+
     // Authenticate all POST requests and /status endpoint
     if (request.method === "POST" || url.pathname.startsWith("/status/")) {
       const authResult = await authenticate(request, env, origin);
@@ -805,7 +971,8 @@ export default {
               );
             }
 
-            // Larger files: upload to GCS, call Gemini with file_uri, then delete GCS object
+            // Larger files: use batch prediction (async, runs on Google's side,
+            // bypasses Cloudflare Worker timeout limits)
             if (!env.GOOGLE_GCS_BUCKET) {
               return jsonResponse(
                 { error: "GCS bucket is not configured for large-file Gemini path. Contact admin." },
@@ -816,34 +983,70 @@ export default {
             }
 
             const uuid = crypto.randomUUID();
-            const objectName = `uploads/${uuid}.${ext}`;
+            const audioObj = `uploads/${uuid}.${ext}`;
+            const jsonlObj = `uploads/${uuid}.input.jsonl`;
+            const outputPrefix = `uploads/${uuid}-out/`;
 
+            // 1. Upload audio
             const gcsUri = await uploadToGCS(
               token,
               env.GOOGLE_GCS_BUCKET,
-              objectName,
+              audioObj,
               arrayBuffer,
               contentTypeHeader,
             );
 
+            // 2. Build & upload JSONL request
+            const prompt = buildGeminiTranscriptionPrompt(language, context);
+            const jsonlLine = JSON.stringify({
+              request: {
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      { fileData: { mimeType: contentTypeHeader, fileUri: gcsUri } },
+                      { text: prompt },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0,
+                  maxOutputTokens: 65536,
+                },
+              },
+            });
+            const jsonlBytes = new TextEncoder().encode(jsonlLine + "\n");
+            const jsonlBuffer = new ArrayBuffer(jsonlBytes.byteLength);
+            new Uint8Array(jsonlBuffer).set(jsonlBytes);
+
+            await uploadToGCS(
+              token,
+              env.GOOGLE_GCS_BUCKET,
+              jsonlObj,
+              jsonlBuffer,
+              "application/jsonl",
+            );
+
+            // 3. Submit batch job
             try {
-              const transcript = await transcribeWithGeminiGcs(
+              const jobName = await submitGeminiBatch(
                 token,
                 sa.project_id,
-                gcsUri,
-                contentTypeHeader,
-                language,
-                context,
+                `gs://${env.GOOGLE_GCS_BUCKET}/${jsonlObj}`,
+                `gs://${env.GOOGLE_GCS_BUCKET}/${outputPrefix}`,
               );
+              const jobId = encodeBatchJobId(jobName, audioObj, jsonlObj, outputPrefix);
               return jsonResponse(
-                { transcript, language: languageHint(language) || "auto", segments: [] },
-                200,
+                { jobId, status: "starting" },
+                202,
                 origin,
                 env.ALLOWED_ORIGINS,
               );
-            } finally {
-              // Always clean up GCS — never retain audio
-              await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, objectName);
+            } catch (err) {
+              // Clean up uploaded files on failure
+              await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, audioObj);
+              await deleteFromGCS(token, env.GOOGLE_GCS_BUCKET, jsonlObj);
+              throw err;
             }
           }
 
@@ -935,7 +1138,112 @@ export default {
           );
         }
 
-        // Gemini is synchronous — no more Google operation polling.
+        // Gemini batch prediction job (long-file path)
+        if (jobId.startsWith("gcb_")) {
+          const decoded = decodeBatchJobId(jobId);
+          if (
+            !decoded ||
+            !env.GOOGLE_SERVICE_ACCOUNT ||
+            !env.GOOGLE_GCS_BUCKET
+          ) {
+            return jsonResponse(
+              { error: "Invalid batch job ID or provider not configured" },
+              400,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
+
+          const bucket = env.GOOGLE_GCS_BUCKET;
+          const sa = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
+          const token = await getAccessToken(sa);
+          const job = await checkGeminiBatch(token, decoded.j);
+
+          const state = job.state;
+          const finished =
+            state === "JOB_STATE_SUCCEEDED" ||
+            state === "JOB_STATE_FAILED" ||
+            state === "JOB_STATE_CANCELLED" ||
+            state === "JOB_STATE_EXPIRED" ||
+            state === "JOB_STATE_PARTIALLY_SUCCEEDED";
+
+          if (!finished) {
+            return jsonResponse(
+              { status: "processing", state },
+              200,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
+
+          // Job is done — fetch output, return transcript, clean up GCS.
+          const cleanup = async () => {
+            // Delete audio + jsonl + all output files
+            await deleteFromGCS(token, bucket, decoded.a);
+            await deleteFromGCS(token, bucket, decoded.i);
+            const outObjs = await listGcsObjects(
+              token,
+              bucket,
+              decoded.o,
+            );
+            for (const o of outObjs) {
+              await deleteFromGCS(token, bucket, o);
+            }
+          };
+
+          if (
+            state === "JOB_STATE_FAILED" ||
+            state === "JOB_STATE_CANCELLED" ||
+            state === "JOB_STATE_EXPIRED"
+          ) {
+            await cleanup();
+            return jsonResponse(
+              {
+                status: "failed",
+                error: job.error?.message || `Batch ${state}`,
+              },
+              200,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
+
+          // Read output JSONL from GCS (look for predictions.jsonl in the
+          // output prefix directory)
+          const outDir =
+            job.outputInfo?.gcsOutputDirectory ||
+            `gs://${bucket}/${decoded.o}`;
+          const prefixInBucket = outDir.replace(`gs://${bucket}/`, "");
+          const outObjs = await listGcsObjects(token, bucket, prefixInBucket);
+          const predictionsObj = outObjs.find((o) => o.endsWith(".jsonl"));
+
+          if (!predictionsObj) {
+            await cleanup();
+            return jsonResponse(
+              { status: "failed", error: "No batch output found" },
+              200,
+              origin,
+              env.ALLOWED_ORIGINS,
+            );
+          }
+
+          const jsonl = await readGcsObject(token, bucket, predictionsObj);
+          const transcript = parseBatchOutputJsonl(jsonl);
+          await cleanup();
+
+          return jsonResponse(
+            {
+              status: "succeeded",
+              transcript,
+              language: "auto",
+              segments: [],
+            },
+            200,
+            origin,
+            env.ALLOWED_ORIGINS,
+          );
+        }
+
         // Replicate prediction
         if (!isValidJobId(jobId)) {
           return jsonResponse(
