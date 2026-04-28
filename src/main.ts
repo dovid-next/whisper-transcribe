@@ -1,5 +1,10 @@
 import "./style.css";
-import { transcribeFile, cancelTranscription, setProgressCallback } from "./api.ts";
+import {
+  transcribeFile,
+  cancelTranscription,
+  setProgressCallback,
+  setStreamCallback,
+} from "./api.ts";
 import type { TranscriptResult } from "./api.ts";
 
 interface FileEntry {
@@ -243,10 +248,47 @@ async function startTranscription() {
       currentFileEl.textContent = `${entry.file.name} — ${elapsed}${stateText}`;
     });
 
+    // Show streaming transcript live as Gemini generates it
+    const streamState: {
+      card: HTMLDivElement | null;
+      textarea: HTMLTextAreaElement | null;
+    } = { card: null, textarea: null };
+    setStreamCallback(({ fullSoFar }) => {
+      resultsSection.hidden = false;
+      if (!streamState.card) {
+        const card = document.createElement("div");
+        card.className = "result-card expanded streaming";
+        card.innerHTML = `
+          <div class="result-card-header">
+            <span class="result-card-title">${escapeHtml(entry.file.name)}</span>
+            <div class="result-card-meta">
+              <span class="lang-badge">streaming…</span>
+            </div>
+          </div>
+          <div class="result-card-body">
+            <textarea readonly></textarea>
+          </div>
+        `;
+        streamState.card = card;
+        streamState.textarea = card.querySelector("textarea") as HTMLTextAreaElement;
+        resultsList.appendChild(card);
+      }
+      if (streamState.textarea) {
+        streamState.textarea.value = fullSoFar;
+        streamState.textarea.scrollTop = streamState.textarea.scrollHeight;
+      }
+    });
+
     try {
       entry.result = await transcribeFile(entry.file, language, state.password, provider, context);
       entry.status = "done";
       completed++;
+      // Replace the streaming card with the final result card if it exists.
+      if (streamState.card) {
+        streamState.card.remove();
+        streamState.card = null;
+        streamState.textarea = null;
+      }
       addResultCard(entry, idx);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
@@ -272,6 +314,7 @@ async function startTranscription() {
     }
 
     setProgressCallback(null);
+    setStreamCallback(null);
 
     renderFileList();
     progressCount.textContent = `${completed}/${total}`;

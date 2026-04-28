@@ -612,6 +612,104 @@ async function transcribeWithGeminiInline(
   return callGemini(token, projectId, audioPart, prompt);
 }
 
+// Open a streaming connection to Gemini and return the upstream Response.
+// Caller is responsible for piping the response body to the client.
+async function streamGemini(
+  token: string,
+  projectId: string,
+  audioPart: Record<string, unknown>,
+  prompt: string,
+): Promise<Response> {
+  const url = `https://${GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${GCP_LOCATION}/publishers/google/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [audioPart, { text: prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 65536,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini ${res.status}: ${err.slice(0, 1500)}`);
+  }
+  return res;
+}
+
+// Build a TransformStream that converts Vertex AI SSE chunks into our own
+// simpler SSE format: `data: {"chunk": "text"}\n\n` and finally
+// `data: {"done": true}\n\n`.
+function buildGeminiSseTransformer(): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+
+  function emit(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    obj: unknown,
+  ) {
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+  }
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      // SSE events are separated by blank lines. Handle both LF and CRLF.
+      while (true) {
+        const i1 = buffer.indexOf("\n\n");
+        const i2 = buffer.indexOf("\r\n\r\n");
+        let idx = -1;
+        let sepLen = 2;
+        if (i1 !== -1 && (i2 === -1 || i1 < i2)) {
+          idx = i1;
+          sepLen = 2;
+        } else if (i2 !== -1) {
+          idx = i2;
+          sepLen = 4;
+        }
+        if (idx === -1) break;
+
+        const event = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + sepLen);
+
+        for (const line of event.split(/\r?\n/)) {
+          if (!line.startsWith("data:")) continue;
+          const json = line.replace(/^data:\s?/, "").trim();
+          if (!json || json === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(json) as GeminiResponse;
+            let text = "";
+            for (const cand of parsed.candidates || []) {
+              for (const part of cand.content?.parts || []) {
+                if (part.text) text += part.text;
+              }
+            }
+            if (text) emit(controller, { chunk: text });
+          } catch {
+            // Ignore unparseable lines.
+          }
+        }
+      }
+    },
+    flush(controller) {
+      emit(controller, { done: true });
+    },
+  });
+}
+
 async function transcribeWithGeminiGcs(
   token: string,
   projectId: string,
@@ -953,22 +1051,51 @@ export default {
             };
             const contentTypeHeader = mimeMap[ext] || "application/octet-stream";
 
-            // Small files (<20MB): send inline
+            // Small files (<20MB): stream inline via SSE so the client sees
+            // text appear as Gemini generates it.
             if (file.size <= 19 * 1024 * 1024) {
-              const transcript = await transcribeWithGeminiInline(
+              const bytes = new Uint8Array(arrayBuffer);
+              let binary = "";
+              const cs = 8192;
+              for (let i = 0; i < bytes.length; i += cs) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + cs));
+              }
+              const base64 = btoa(binary);
+              const audioPart = {
+                inline_data: { mime_type: contentTypeHeader, data: base64 },
+              };
+              const prompt = buildGeminiTranscriptionPrompt(language, context);
+
+              const upstream = await streamGemini(
                 token,
                 sa.project_id,
-                arrayBuffer,
-                contentTypeHeader,
-                language,
-                context,
+                audioPart,
+                prompt,
               );
-              return jsonResponse(
-                { transcript, language: languageHint(language) || "auto", segments: [] },
-                200,
-                origin,
-                env.ALLOWED_ORIGINS,
+
+              if (!upstream.body) {
+                return jsonResponse(
+                  { error: "No response body from Gemini" },
+                  500,
+                  origin,
+                  env.ALLOWED_ORIGINS,
+                );
+              }
+
+              const stream = upstream.body.pipeThrough(
+                buildGeminiSseTransformer(),
               );
+
+              return new Response(stream, {
+                status: 200,
+                headers: {
+                  "Content-Type": "text/event-stream",
+                  "Cache-Control": "no-cache",
+                  "X-Content-Type-Options": "nosniff",
+                  "X-Frame-Options": "DENY",
+                  ...corsHeaders(origin, env.ALLOWED_ORIGINS),
+                },
+              });
             }
 
             // Larger files: use batch prediction (async, runs on Google's side,

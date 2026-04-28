@@ -563,6 +563,25 @@ header h1 {
   display: block;
 }
 
+/* Streaming card — subtle pulsing border to show "in progress" */
+.result-card.streaming {
+  border-color: var(--primary);
+  box-shadow:
+    0 0 0 3px var(--primary-light),
+    var(--shadow);
+  animation: streamingPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes streamingPulse {
+  0%, 100% { box-shadow: 0 0 0 3px var(--primary-light), var(--shadow); }
+  50% { box-shadow: 0 0 0 5px var(--primary-light), var(--shadow); }
+}
+
+.result-card.streaming .lang-badge {
+  background: var(--primary);
+  color: white;
+}
+
 .result-card-body textarea {
   width: 100%;
   min-height: 150px;

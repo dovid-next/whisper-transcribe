@@ -26,6 +26,16 @@ export function setProgressCallback(cb: ProgressCallback | null) {
   currentProgressCallback = cb;
 }
 
+// Optional callback for streaming transcript chunks as they arrive.
+export type StreamCallback = (info: {
+  delta: string;
+  fullSoFar: string;
+}) => void;
+let currentStreamCallback: StreamCallback | null = null;
+export function setStreamCallback(cb: StreamCallback | null) {
+  currentStreamCallback = cb;
+}
+
 // Current AbortController — allows cancelling in-flight requests
 let currentAbortController: AbortController | null = null;
 
@@ -61,11 +71,21 @@ export async function transcribeFile(
     signal,
   });
 
-  const data: TranscribeResponse & { locked?: boolean; remainingAttempts?: number } = await response.json();
-
   if (response.status === 423) {
     throw new Error("LOCKED: Access locked after too many failed attempts. Contact admin to unlock.");
   }
+
+  // Streaming SSE response (Google provider, small files)
+  const contentType = response.headers.get("Content-Type") || "";
+  if (
+    response.status === 200 &&
+    contentType.toLowerCase().includes("text/event-stream") &&
+    response.body
+  ) {
+    return readStreamingTranscript(response.body, signal);
+  }
+
+  const data: TranscribeResponse & { locked?: boolean; remainingAttempts?: number } = await response.json();
 
   if (response.status === 401) {
     const msg = data.remainingAttempts !== undefined
@@ -91,6 +111,70 @@ export async function transcribeFile(
   }
 
   throw new Error("Unexpected response from server");
+}
+
+async function readStreamingTranscript(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): Promise<TranscriptResult> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let transcript = "";
+  let serverError: string | null = null;
+
+  while (true) {
+    if (signal.aborted) throw new Error("Cancelled");
+
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Parse SSE events
+    while (true) {
+      const idx = buffer.indexOf("\n\n");
+      if (idx === -1) break;
+      const event = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+
+      for (const line of event.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const json = line.replace(/^data:\s?/, "").trim();
+        if (!json) continue;
+        try {
+          const parsed = JSON.parse(json) as {
+            chunk?: string;
+            done?: boolean;
+            error?: string;
+          };
+          if (parsed.error) {
+            serverError = parsed.error;
+          }
+          if (parsed.chunk) {
+            transcript += parsed.chunk;
+            if (currentStreamCallback) {
+              currentStreamCallback({
+                delta: parsed.chunk,
+                fullSoFar: transcript,
+              });
+            }
+          }
+        } catch {
+          // ignore unparseable
+        }
+      }
+    }
+  }
+
+  if (serverError) throw new Error(serverError);
+  if (!transcript.trim()) throw new Error("No transcript returned");
+
+  return {
+    transcript: transcript.trim(),
+    language: "auto",
+    segments: undefined,
+  };
 }
 
 async function pollForResult(jobId: string, password: string, signal: AbortSignal): Promise<TranscriptResult> {
